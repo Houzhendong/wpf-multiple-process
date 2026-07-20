@@ -66,6 +66,12 @@ WpfMultiProcess.exe --child --feature=waveform --socket=%TEMP%\wpfmp-<hostpid>.s
   `ShowWindow(SW_HIDE)`）让请求改为 post 给目标线程、调用方立即返回，才是
   真正隔离卡死影响的关键。
   dock pane 拖动/隐藏/浮动时占位控件 `Unloaded`/不可见 → 子窗口 `SW_HIDE`。
+  `LayoutUpdated` 是"整窗任意布局 pass 完成"级别的事件，tab 切换期间会连续
+  触发几十次，`UpdatePlacement` 因此加了脏检查（位置/大小/可见性/Z 序都和
+  上次发出的一致就直接跳过）并把 `LayoutUpdated`/`IsVisibleChanged`/宿主
+  `WM_WINDOWPOSCHANGED` 都改成 `Dispatcher.BeginInvoke` 去抖合并成一次；
+  被切走隐藏的子窗口也暂停重绘——否则异步 `SetWindowPos` 请求会在子进程
+  消息队列里越积越多，最新位置反而要排在最后处理，表现为跟随明显变慢。
 - **生命周期**：
   - 主窗口关闭 → stream 推 `Shutdown` → 子进程 `Close()`；1.5s 未退则 `Kill()` 兜底。
   - 主进程崩溃 → 子进程监听 `Process.Exited` 自杀 + stream 断开双保险。

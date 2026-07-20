@@ -23,6 +23,12 @@ public sealed class ChildWindow : Window
     private readonly TextBlock _heartbeat = new() { Margin = new Thickness(8, 0, 8, 4), Foreground = Brushes.DarkGray };
     private readonly List<double> _values = new();
 
+    private nint _hwndSelf;
+    // 隐藏(被切走的 tab)期间收到的数据帧跳过重绘,标记补一次画;避免
+    // 每 50ms 一次的全量 Polyline 重建占满 UI 线程、拖慢主进程异步 post
+    // 过来的 SetWindowPos 位置纠正请求的处理(见 OverlayHost 的脏检查注释)。
+    private bool _needsRedraw;
+
     public ChildWindow(CmdLine opts)
     {
         _ipc = new ChildIpcClient(opts.FeatureId, opts.SocketPath);
@@ -46,6 +52,20 @@ public sealed class ChildWindow : Window
         // 但主进程侧仍希望"我被点了"能把宿主提到前面,所以点击时 fire-and-forget
         // 上报一次 focus_request,不阻塞输入本身。
         PreviewMouseDown += (_, _) => _ = ReportFocusRequestAsync();
+
+        // Win32 级隐藏(SWP_HIDEWINDOW)通常会同步反映到 WPF 的 IsVisible,
+        // 但隐藏期间被跳过的重绘不能指望"下一次可见"一定先经过这里 —— 保底
+        // 用 IsWindowVisible 直接问一遍再决定是否需要补画。
+        IsVisibleChanged += (_, _) => TryRedrawIfPending();
+    }
+
+    private void TryRedrawIfPending()
+    {
+        if (_needsRedraw && Win32.IsWindowVisible(_hwndSelf))
+        {
+            RedrawLine();
+            _needsRedraw = false;
+        }
     }
 
     private async Task ReportFocusRequestAsync()
@@ -121,14 +141,14 @@ public sealed class ChildWindow : Window
             // 0) 不再和宿主建立 owner 关系(见 OverlayHost 顶部说明),子窗口自身
             // 改为不可激活的工具窗:WS_EX_NOACTIVATE 让点击不抢激活焦点、不扰乱
             // OverlayHost 手动维护的 Z 序;WS_EX_TOOLWINDOW 保持不进 Alt-Tab/任务栏。
-            var hwndSelf = new WindowInteropHelper(this).Handle;
-            nint exStyle = Win32.GetWindowLongPtr(hwndSelf, Win32.GWL_EXSTYLE);
-            Win32.SetWindowLongPtr(hwndSelf, Win32.GWL_EXSTYLE,
+            _hwndSelf = new WindowInteropHelper(this).Handle;
+            nint exStyle = Win32.GetWindowLongPtr(_hwndSelf, Win32.GWL_EXSTYLE);
+            Win32.SetWindowLongPtr(_hwndSelf, Win32.GWL_EXSTYLE,
                 exStyle | (nint)(Win32.WS_EX_NOACTIVATE | Win32.WS_EX_TOOLWINDOW));
 
             // WS_EX_NOACTIVATE 本身已经能挡掉大部分激活,这里再挂一层 WM_MOUSEACTIVATE
             // 钩子保底:点击仍然正常派发鼠标消息(按钮能点),只是不激活窗口。
-            HwndSource.FromHwnd(hwndSelf)?.AddHook(OnWndProc);
+            HwndSource.FromHwnd(_hwndSelf)?.AddHook(OnWndProc);
 
             // 1) unary 获取初始化参数
             var init = await _ipc.GetInitParamsAsync();
@@ -150,7 +170,7 @@ public sealed class ChildWindow : Window
             _ipc.StartSubscription();
 
             // 3) 上报 HWND,主进程据此手动 overlay(不再 SetOwner,见 OverlayHost 说明)
-            await _ipc.RegisterWindowAsync(hwndSelf);
+            await _ipc.RegisterWindowAsync(_hwndSelf);
         }
         catch
         {
@@ -178,7 +198,17 @@ public sealed class ChildWindow : Window
         _latest.Text = data.Text;
         _values.Add(data.Value);
         if (_values.Count > MaxPoints) _values.RemoveAt(0);
+
+        // 数据照常入队(环形截断),但被切走的 tab 不可见时跳过重绘 —— 见字段
+        // 注释。用 Win32 IsWindowVisible 而不是 WPF IsVisible,避免依赖两套
+        // 可见性状态同步的时序假设。
+        if (!Win32.IsWindowVisible(_hwndSelf))
+        {
+            _needsRedraw = true;
+            return;
+        }
         RedrawLine();
+        _needsRedraw = false;
     }
 
     private void RedrawLine()

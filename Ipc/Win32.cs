@@ -66,4 +66,13 @@ internal static partial class Win32
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool IsIconic(nint hWnd);
+
+    /// <summary>
+    /// 查子窗口自己的 Win32 可见性,而不是 WPF 的 IsVisible/IsVisibleChanged:
+    /// 隐藏路径是主进程异步 post 过来的 SetWindowPos+SWP_HIDEWINDOW,和本地
+    /// WPF 布局系统更新 IsVisible 之间不保证严格同步,直接问 Win32 最准确。
+    /// </summary>
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool IsWindowVisible(nint hWnd);
 }
