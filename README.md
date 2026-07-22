@@ -11,42 +11,99 @@ dotnet run            # 主进程（自动拉起两个子进程: waveform / tabl
 子进程由主进程自动启动，参数形如：
 
 ```
-WpfMultiProcess.exe --child --feature=waveform --socket=%TEMP%\wpfmp-<hostpid>.sock --hostpid=<hostpid>
+WpfMultiProcess.exe --child --feature=waveform --session=<guid> --socket=%TEMP%\wpfmp-<hostpid>.sock --hostpid=<hostpid>
 ```
+
+`session_id` 由**主进程生成**（`MainWindow.LaunchChild` 里 `Guid.NewGuid()`），作为启动参数
+传给子进程，并在拉起子进程之前先调用 `SessionHub.Prepare(sessionId, featureId)` 登记
+"这个 session_id 属于哪个 feature"——子进程不再需要一次单独的 RPC 去问"我是谁"。
 
 ## 架构
 
+框架分两层：一层**共享公共服务**（`CommonService`：只剩 `Pong`/`RequestActivate` 两个
+按 `session_id` 路由的 unary，注册/开窗环节已经合并进各 feature 自己的流里），
+每个 feature 之上再挂一个**独立的 gRPC 服务**（`WaveformService`/`TableService`……），
+各自的 `Register(StreamRequest{session_id, hwnd, pid})` 返回强类型 server stream，
+stream 里用 `oneof` 把开场的 `RegisterReply`（标题/主题色）、公共 `Control`
+（Ping/Shutdown）和 feature 自己的数据帧（`WaveformFrame`/`TableDelta`）三路复用进
+同一个 envelope 里推送——新增一个 feature 只需要新增一个 proto + 一对 Host/Child
+模块，不需要改动公共服务或其他 feature。
+
 ```
-┌────────────────────── 主进程 (gRPC Server, Kestrel/UDS) ──────────────────────┐
-│  MainWindow (AvalonDock VS2013 主题)                                          │
-│    ├── LayoutDocument "waveform" → OverlayHost(空白占位)                      │
-│    ├── LayoutDocument "table"    → OverlayHost(空白占位)                      │
-│    └── 事件日志 anchorable + 心跳状态栏                                        │
-│  HostCoordinator: 每 feature 一个有界 Channel<ServerMessage>                  │
-│    ├── DataLoop   50ms  → FeatureData(server stream 推送)                    │
-│    └── Heartbeat  2s    → Ping{seq, timestamp}(同一条 stream 推送)           │
-└──────────────────────────────┬───────────────────────────────────────────────┘
-                    UDS: %TEMP%\wpfmp-<pid>.sock (HTTP/2)
-┌──────────────────────────────┴─────────────── 子进程 (gRPC Client) ──────────┐
-│  ChildWindow(WindowStyle=None, ShowInTaskbar=false, 初始位置屏幕外)           │
-│    1. unary GetInitParams   → 标题/主题色/配置                                │
-│    2. Subscribe server stream → FeatureData / Ping / Shutdown                │
-│    3. unary RegisterWindow(hwnd) → 主进程手动 Z 序 + overlay                 │
-│    4. Ping 到达 → Dispatcher 调度到 UI 线程 → unary Pong(回显时间戳)          │
-│    5. 按钮点击 → unary ReportInteraction                                     │
-└──────────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────── 主进程 (gRPC Server, Kestrel/UDS) ──────────────────────────┐
+│  MainWindow (AvalonDock VS2013 主题,tab 列表来自 HostFeatureRegistry.Modules)         │
+│    ├── LaunchChild: 生成 session_id → hub.Prepare(id, featureId) → 传 --session 启动  │
+│    ├── LayoutDocument "waveform" → OverlayHost(空白占位)                              │
+│    ├── LayoutDocument "table"    → OverlayHost(空白占位)                              │
+│    └── 事件日志 anchorable + 心跳状态栏（订阅 SessionHub 的事件）                      │
+│                                                                                        │
+│  CommonServiceImpl(公共服务,feature 无关)          HostFeatureRegistry             │
+│    Pong/RequestActivate → 按 session_id 查表         ├── WaveformHostModule          │
+│         ↓ 委托                                       │      → WaveformServiceImpl    │
+│  SessionHub                                          │         Register: TryOpen →   │
+│    ├── Prepare(id,featureId) 预登记 / TryOpen 校验并落 hwnd  写 Reply → 50ms 正弦帧    │
+│    ├── Heartbeat 2s → Control{Ping} 推给所有订阅       │         + min/max/avg/count  │
+│    ├── CheckUnresponsive(5000ms 阈值)→ UiUnresponsive/UiRecovered  └── TableHostModule│
+│    └── AttachStream/DetachStream(Subscription<TEnv>,每 feature 一个有界 channel)     │
+│                 → TableServiceImpl(Register: TryOpen → 写 Reply → 8 行动态表          │
+│                    + Sort unary + upsert/remove/reorder)                              │
+└──────────────────────────────────────────┬───────────────────────────────────────────┘
+                                UDS: %TEMP%\wpfmp-<hostpid>.sock (HTTP/2,多服务共用一个端点)
+┌──────────────────────────────────────────┴────────────── 子进程 (gRPC Client) ───────┐
+│  ChildShell(WindowStyle=None, ShowInTaskbar=false, 初始位置屏幕外,框架级状态条)        │
+│  session_id 来自 --session 启动参数,不再有独立会话对象；同一个 Channel 上多建一个       │
+│  CommonServiceClient 供 Pong/RequestActivate 使用                                     │
+│    1. SourceInitialized: 拿到 hwnd → 建 Channel + CommonServiceClient → ChildContext  │
+│    2. ChildFeatureRegistry.Get(featureId).CreateView(ctx) → feature 视图自己开流       │
+│    3. feature 视图: WaveformService/TableService.Register(session_id, hwnd, pid) 开流  │
+│         → down.Reply    → ChildShell.ApplyReply(标题/主题色)                          │
+│         → down.Control  → ChildShell.OnPing(转发 CommonService.Pong) / RequestClose   │
+│         → down.Frame/Delta → 更新 UI(波形折线 / DataGrid 行)                          │
+│    4. 点击子窗口 → ChildShell.RequestActivate() → CommonService.RequestActivate       │
+│    5. feature 按钮(统计/排序) → 各自 feature 服务的 unary RPC                          │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## 关键设计点
 
+- **可插拔的多 feature 架构**：公共服务（`CommonService`：只剩 `Pong`/`RequestActivate`，
+  都按 `session_id` 路由，不知道也不关心是哪个 feature）与具体业务完全解耦；会话的
+  建立（原来独立的 `Register`/`RegisterWindow`）合并进了每个 feature 自己 `Register`
+  的开流请求里（`StreamRequest{session_id, hwnd, pid}`）——`session_id` 由主进程作为
+  启动参数下发、`SessionHub.Prepare` 预登记它归属哪个 feature，子进程开流时报上
+  `hwnd`/`pid`，`SessionHub.TryOpen` 校验 session_id 确实是给这个 feature 预留的之后
+  才算真正建立会话、落地 hwnd 触发 overlay。每个 feature 各自拥有一个独立 gRPC 服务
+  （`WaveformService`/`TableService`……），其 `Register` 返回的强类型 stream 用
+  `oneof` 三路复用：开场先写一帧 `RegisterReply`（标题/主题色，从
+  `SessionHub.ReplyOf(featureId)` 取），随后是公共 `Control`（Ping/Shutdown）和
+  feature 自己的数据帧，全部封装在同一个 envelope 里。主/子进程各有一个对称的
+  wrap/unwrap 接缝：主进程侧 `Subscription<TEnv>` 用构造时传入的
+  `Func<Control,TEnv> wrap` 把心跳/关闭包成 feature 自己的 envelope 类型再推流；
+  子进程侧每个 feature 视图从自己的 envelope 里把 `Control` 解出来，统一转发给
+  `ChildShell.OnPing`/`RequestClose`（回 Pong 时走的是同一个 Channel 上另建的
+  `CommonServiceClient`，一次普通的 fire-and-forget unary，不是往 stream 里写，没有
+  并发写的坑；回 Pong / 关窗口的行为与具体 feature 完全无关）。子进程不再有独立的
+  会话对象——`ChildContext`（`Channel`/`SessionId`/`Shell`）只是把这几样东西打包传给
+  `IFeatureChildModule.CreateView`，feature 视图自己攥着 stream 生命周期。主进程侧
+  `HostFeatureRegistry`、子进程侧 `ChildFeatureRegistry` 各自维护"featureId → 模块"的
+  映射，`MainWindow` 的 tab 列表和子进程的视图构造都从各自 registry 里迭代/查表
+  得到——新增一个 feature 只需要新增一个 proto + 一对 Host/Child 模块并注册进
+  registry，不需要改动公共服务、`MainWindow`、`ChildShell` 或其他 feature 的任何
+  代码。
 - **进程模型**：`Program.Main` 按 `--child` 分流到 `HostProgram` / `ChildProgram`。
   套接字路径含主进程 PID，支持应用多开互不干扰。
 - **UDS 通道**：客户端用 `SocketsHttpHandler.ConnectCallback` 手工连 `UnixDomainSocketEndPoint`
-  （`Ipc/GrpcUds.cs`）；服务端 Kestrel `ListenUnixSocket` + HTTP/2。
-- **推送背压**：每个订阅一个 `BoundedChannel(256, DropOldest)`，子进程消费慢时丢最旧数据帧，
-  主进程不会被拖垮；Ping/Shutdown 与数据共用一条 stream（`oneof payload`）。
-- **心跳语义**：主进程 2s 推一次 `Ping{seq, timestamp}`；子进程收到后先 `Dispatcher.BeginInvoke`
-  到 UI 线程再发 `Pong` unary——因此 RTT 度量的是"子进程 UI 线程健康度"，UI 卡死时心跳即断。
+  （`Ipc/GrpcUds.cs`）；服务端 Kestrel `ListenUnixSocket` + HTTP/2，`CommonService` 与
+  各 feature 的 gRPC 服务共用同一个端点，靠 gRPC 自身的服务路由区分；子进程侧同一个
+  `GrpcChannel` 上既建 feature 的 stream 客户端，也建 `CommonServiceClient`。
+- **推送背压**：`SessionHub.AttachStream` 为每个会话的每个订阅建一个
+  `Subscription<TEnv>`，内部是一个 `BoundedChannel(256, DropOldest)`，子进程消费慢时
+  丢最旧数据帧，主进程不会被拖垮；Ping/Shutdown 与 feature 数据共用同一条 stream
+  （`oneof payload`）。
+- **心跳语义**：`SessionHub` 2s 推一次 `Control{Ping{seq, timestamp}}` 给所有 feature 的
+  所有订阅；子进程收到后先 `Dispatcher.BeginInvoke` 到 UI 线程再发 `Pong` unary——
+  因此 RTT 度量的是"子进程 UI 线程健康度"，UI 卡死时心跳即断，`SessionHub.CheckUnresponsive`
+  按 5000ms 阈值只在状态翻转时触发一次 `UiUnresponsive`/`UiRecovered`，避免刷屏。
 - **窗口嵌入**：不用 `SetParent`，也**不用** `SetWindowLongPtr(GWLP_HWNDPARENT)` 做
   owner 关系——早期方案曾用 owner，但跨进程 owner/SetParent 都会让 Windows 隐式合并
   两个线程的输入队列（等效 `AttachThreadInput`），一旦子进程 UI 线程卡死，主进程和
@@ -57,8 +114,8 @@ WpfMultiProcess.exe --child --feature=waveform --socket=%TEMP%\wpfmp-<hostpid>.s
   窗口插到宿主正上方，靠"持续纠正 Z 序"代替 owner 关系。子窗口自身加
   `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` 并拦截 `WM_MOUSEACTIVATE` 返回
   `MA_NOACTIVATE`：点击不激活、不进 Alt-Tab/任务栏、也不会自己扰乱这里维护的 Z 序；
-  代价是点击子窗口不会带起主窗口，用一次 `ReportInteraction("focus_request", ...)`
-  上报换取主窗口 `Activate()` 补偿。**关键坑**：光去掉 owner 关系还不够——
+  代价是点击子窗口不会带起主窗口，用一次 `CommonService.RequestActivate` unary
+  （按 session_id 上报）换取主窗口 `Activate()` 补偿。**关键坑**：光去掉 owner 关系还不够——
   `SetWindowPos`/`ShowWindow` 对不同线程（含跨进程）的窗口默认会像 `SendMessage`
   一样同步阻塞发消息，子窗口卡死时仍会拖住调用方所在的主进程 UI 线程（实测
   子窗口卡死几秒后主窗口对 `SendMessageTimeout` 也会短暂无响应）。必须加上
@@ -73,7 +130,8 @@ WpfMultiProcess.exe --child --feature=waveform --socket=%TEMP%\wpfmp-<hostpid>.s
   被切走隐藏的子窗口也暂停重绘——否则异步 `SetWindowPos` 请求会在子进程
   消息队列里越积越多，最新位置反而要排在最后处理，表现为跟随明显变慢。
 - **生命周期**：
-  - 主窗口关闭 → stream 推 `Shutdown` → 子进程 `Close()`；1.5s 未退则 `Kill()` 兜底。
+  - 主窗口关闭 → `SessionHub.PushShutdownAll()` 给每个订阅推 `Control{Shutdown}` →
+    子进程 `Close()`；1.5s 未退则 `Kill()` 兜底。
   - 主进程崩溃 → 子进程监听 `Process.Exited` 自杀 + stream 断开双保险。
   - 子进程退出/断开 → `OverlayHost.DetachChild()` 回到空白占位。
 - **DPI**：主/子进程同一 manifest（PerMonitorV2），`PointToScreen` 直接给出物理像素，
@@ -83,15 +141,26 @@ WpfMultiProcess.exe --child --feature=waveform --socket=%TEMP%\wpfmp-<hostpid>.s
 
 | 文件 | 职责 |
 |---|---|
-| `Protos/ipc.proto` | 服务契约：Subscribe(server stream) + 4 个 unary |
-| `Program.cs` | 入口 + 命令行解析 |
+| `Protos/common.proto` | 公共契约：`CommonService`(Pong/RequestActivate，按 session_id 路由) + 共享消息(`RegisterReply`/`Control`(Ping/Shutdown)/`Ack`) |
+| `Protos/waveform.proto` | `WaveformService`：Register(StreamRequest{session_id,hwnd,pid} → server stream, envelope = Reply⊕Control⊕Frame) + GetStatistics unary |
+| `Protos/table.proto` | `TableService`：Register(StreamRequest{session_id,hwnd,pid} → server stream, envelope = Reply⊕Control⊕Delta) + Sort unary |
+| `Program.cs` | 入口 + 命令行解析(`CmdLine` 含 `SessionId`，来自 `--session`) |
 | `Ipc/GrpcUds.cs` | UDS 通道工厂（socket 路径约定） |
 | `Ipc/Win32.cs` | GetWindow / GetWindowLongPtr / SetWindowLongPtr / SetWindowPos / ShowWindow P/Invoke |
-| `Host/HostProgram.cs` | Kestrel 启动 + WPF 消息循环 + 清理 |
-| `Host/HostCoordinator.cs` | 订阅表、数据泵、心跳泵、上行事件分发 |
-| `Host/IpcService.cs` | gRPC 服务实现（薄壳，状态在 Coordinator） |
-| `Host/MainWindow.cs` | AvalonDock 布局、子进程启动/回收、日志 |
-| `Host/OverlayHost.cs` | 占位控件：无 owner 关系,SetWindowPos(异步)钉位置+Z 序 |
+| `Host/HostProgram.cs` | Kestrel 启动 + 服务注册(CommonService + 各 feature 服务) + WPF 消息循环 + 清理 |
+| `Host/Session/Subscription.cs` | 订阅句柄：`Subscription<TEnv>` 持有有界 channel + `Func<Control,TEnv> wrap` |
+| `Host/Session/SessionHub.cs` | `Prepare`/`TryOpen` session_id↔featureId 映射与校验、`ReplyOf`、心跳泵(2s)/无响应检测(5000ms)、订阅表(Attach/DetachStream)、上行事件 |
+| `Host/CommonServiceImpl.cs` | `CommonService` 实现（薄壳，Pong/RequestActivate 按 session_id 转发给 SessionHub） |
+| `Host/IFeatureHostModule.cs` | feature 主进程侧模块契约：FeatureId/Descriptor/Map(endpoints) |
+| `Host/HostFeatureRegistry.cs` | 持有全部 `IFeatureHostModule`，`MainWindow`/`HostProgram` 据此迭代 |
+| `Host/Features/Waveform/WaveformHostModule.cs`, `WaveformServiceImpl.cs` | 波形 feature：Register 先 TryOpen 再写 Reply，随后 50ms 正弦帧 + min/max/avg/count 统计 |
+| `Host/Features/Table/TableHostModule.cs`, `TableServiceImpl.cs` | 表格 feature：Register 先 TryOpen 再写 Reply，随后动态行(增删/变值) + Sort unary |
+| `Host/MainWindow.cs` | AvalonDock 布局(tab 来自 registry)、`LaunchChild` 生成 session_id 并 `hub.Prepare`、订阅 SessionHub 事件、日志、F9 float/dock |
+| `Host/OverlayHost.cs` | 占位控件：无 owner 关系,SetWindowPos(异步)钉位置+Z 序（feature 无关，未改动） |
 | `Child/ChildProgram.cs` | 子进程入口 + 孤儿自杀 |
-| `Child/ChildIpcClient.cs` | stream 订阅 + unary 封装 |
-| `Child/ChildWindow.cs` | 无边框窗口、波形渲染、UI 线程 Pong |
+| `Child/ChildContext.cs` | `{Channel, SessionId, Shell}` 只读结构体，传给 `IFeatureChildModule.CreateView`；子进程不再有独立会话对象 |
+| `Child/ChildShell.cs` | 无边框窗口框架：持有 Channel + `CommonServiceClient`（Pong/RequestActivate）+ Win32 摆位/激活拦截 + 状态条，中间区域交给 feature 视图自己开流 |
+| `Child/IFeatureChildModule.cs` | feature 子进程侧模块契约：FeatureId/CreateView(ChildContext) |
+| `Child/ChildFeatureRegistry.cs` | 持有全部 `IFeatureChildModule`，`ChildShell` 据 `--feature` 查表 |
+| `Child/Features/Waveform/WaveformChildModule.cs`, `WaveformView.cs` | 波形视图：自己开 `WaveformService.Register` 流，demux Reply/Control/Frame，Polyline 渲染(隐藏时暂停) + 统计按钮 |
+| `Child/Features/Table/TableChildModule.cs`, `TableView.cs` | 表格视图：自己开 `TableService.Register` 流，demux Reply/Control/Delta，DataGrid + 排序按钮 |

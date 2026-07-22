@@ -25,7 +25,9 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Protobuf Include="Protos\ipc.proto" GrpcServices="Both" />
+    <Protobuf Include="Protos\common.proto" ProtoRoot="Protos" GrpcServices="Both" />
+    <Protobuf Include="Protos\waveform.proto" ProtoRoot="Protos" GrpcServices="Both" />
+    <Protobuf Include="Protos\table.proto" ProtoRoot="Protos" GrpcServices="Both" />
   </ItemGroup>
 
 </Project>

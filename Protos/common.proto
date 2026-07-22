@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+option csharp_namespace = "WpfMultiProcess.Ipc.Common";
+
+package ipc.common;
+
+// 会话建立本身已经并入各 feature 自己的 server-stream Register(见 waveform.proto /
+// table.proto 的 StreamRequest{session_id, hwnd, pid}),这里只剩下真正 feature-无关、
+// 且不方便挂在 stream 上的两个 unary:子进程 UI 线程回 Pong、子进程点击后请求主进程
+// 补偿激活。session_id 本身由主进程在拉起子进程前生成,当启动参数传入,不再靠一次
+// Register RPC 换取。
+service CommonService {
+  // 子进程收到 Ping 后在 UI 线程回 Pong,证明 UI 线程存活。
+  rpc Pong (PongRequest) returns (Ack);
+
+  // 子进程被点击(WS_EX_NOACTIVATE 拦掉了自然激活)时上报,换取主进程 Activate() 补偿。
+  rpc RequestActivate (ActivateRequest) returns (Ack);
+}
+
+// Register 时回给子进程的展示元数据,现在搭在各 feature 自己 stream 的 XxxDown
+// oneof 里(第一条消息),不再是单独一个 unary 的返回值。
+message RegisterReply {
+  string title = 1;
+  string accent_color = 2;
+  map<string, string> settings = 3;
+}
+
+message PongRequest {
+  string session_id = 1;
+  int64 seq = 2;
+  int64 ping_timestamp_ms = 3;  // 回显 Ping 的时间戳
+  int64 pong_timestamp_ms = 4;  // 子进程 UI 线程处理时刻
+}
+
+message ActivateRequest {
+  string session_id = 1;
+}
+
+message Ack {
+  bool ok = 1;
+}
+
+// 共享的控制消息:搭在每个 feature 自己的 stream 的 oneof envelope(XxxDown)里,
+// 而不是单开一条 stream。
+message Ping {
+  int64 seq = 1;
+  int64 timestamp_ms = 2;
+}
+
+message Shutdown {
+}
+
+message Control {
+  oneof kind {
+    Ping ping = 1;
+    Shutdown shutdown = 2;
+  }
+}

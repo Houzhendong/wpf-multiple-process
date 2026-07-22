@@ -8,15 +8,17 @@ using System.Windows.Media;
 using AvalonDock;
 using AvalonDock.Layout;
 using AvalonDock.Themes;
+using WpfMultiProcess.Host.Session;
 
 namespace WpfMultiProcess.Host;
 
-/// <summary>主窗口:VS 风格 DockingManager,每个 feature 一个 LayoutDocument,内容是 OverlayHost 占位。</summary>
+/// <summary>主窗口:VS 风格 DockingManager,每个已注册 feature 模块一个 LayoutDocument,
+/// 内容是 OverlayHost 占位。feature 列表不再硬编码,来自 HostFeatureRegistry —— 新增一个
+/// feature 只需要往 registry 里多塞一个模块,这里自动多出一个 tab + 自动拉起对应子进程。</summary>
 public sealed class MainWindow : Window
 {
-    private static readonly string[] Features = ["waveform", "table"];
-
-    private readonly HostCoordinator _coordinator;
+    private readonly SessionHub _hub;
+    private readonly HostFeatureRegistry _registry;
     private readonly string _socketPath;
     private readonly Dictionary<string, OverlayHost> _hosts = new();
     private readonly Dictionary<string, Process> _children = new();
@@ -28,9 +30,10 @@ public sealed class MainWindow : Window
     private LayoutDocumentPane _docPane = null!;
     private DockingManager _dockingManager = null!;
 
-    public MainWindow(HostCoordinator coordinator, string socketPath)
+    public MainWindow(SessionHub hub, HostFeatureRegistry registry, string socketPath)
     {
-        _coordinator = coordinator;
+        _hub = hub;
+        _registry = registry;
         _socketPath = socketPath;
 
         Title = $"WpfMultiProcess 主进程 (pid {Environment.ProcessId})";
@@ -38,13 +41,13 @@ public sealed class MainWindow : Window
         Height = 700;
         Content = BuildLayout();
 
-        WireCoordinator();
-        Loaded += (_, _) => { foreach (var f in Features) LaunchChild(f); };
+        WireHub();
+        Loaded += (_, _) => { foreach (var m in _registry.Modules) LaunchChild(m.FeatureId); };
         Closing += (_, _) => ShutdownChildren();
 
         // 测试钩子:F9 把当前选中(或第一个)feature 的 LayoutDocument 在
         // 浮动/停靠间切换,用于验证 OverlayHost 在 dock↔float 切换后能正确
-        // 把子窗口 owner 重新指向新的宿主窗口。
+        // 把子窗口重新 overlay 到新的宿主窗口。
         PreviewKeyDown += (_, e) =>
         {
             if (e.Key != Key.F9) return;
@@ -99,14 +102,14 @@ public sealed class MainWindow : Window
             },
         };
 
-        foreach (var f in Features)
+        foreach (var m in _registry.Modules)
         {
             var host = new OverlayHost();
-            _hosts[f] = host;
+            _hosts[m.FeatureId] = host;
             _docPane.Children.Add(new LayoutDocument
             {
-                Title = f,
-                ContentId = f,
+                Title = m.Descriptor.Title,
+                ContentId = m.FeatureId,
                 Content = host,
                 CanClose = false,
             });
@@ -130,47 +133,45 @@ public sealed class MainWindow : Window
         return grid;
     }
 
-    private void WireCoordinator()
+    private void WireHub()
     {
-        // Coordinator 事件来自 gRPC 线程池,这里统一调度回 UI 线程
-        _coordinator.SubscriberConnected += (f, pid) =>
-            Dispatcher.BeginInvoke(() => Log($"[{f}] 子进程 pid {pid} 已订阅"));
+        // SessionHub 事件来自 gRPC 线程池,这里统一调度回 UI 线程
+        _hub.SessionConnected += (f, pid) =>
+            Dispatcher.BeginInvoke(() => Log($"[{f}] 子进程 pid {pid} 已注册会话"));
 
-        _coordinator.SubscriberDisconnected += f =>
+        _hub.SessionDisconnected += f =>
             Dispatcher.BeginInvoke(() =>
             {
-                Log($"[{f}] 订阅断开");
+                Log($"[{f}] 会话断开");
                 if (_hosts.TryGetValue(f, out var h)) h.DetachChild();
             });
 
-        _coordinator.WindowRegistered += (f, hwnd, pid) =>
+        _hub.WindowRegistered += (f, hwnd) =>
             Dispatcher.BeginInvoke(() =>
             {
-                Log($"[{f}] 收到 HWND 0x{hwnd:X},执行 SetOwner + overlay");
+                Log($"[{f}] 收到 HWND 0x{hwnd:X},执行 overlay");
                 if (_hosts.TryGetValue(f, out var h)) h.AttachChild(hwnd);
             });
 
-        _coordinator.InteractionReceived += (f, action, payload) =>
+        _hub.ActivateRequested += f =>
             Dispatcher.BeginInvoke(() =>
             {
-                if (action == "focus_request")
-                {
-                    // 子窗口现在是 WS_EX_NOACTIVATE,点击不会自己抢激活/提 Z 序,
-                    // 这里补偿式地把主窗口(宿主)激活一下,换取"点了有反应"的体验。
-                    // 注:浮动窗格场景下激活的是主窗口而非浮动窗口本身,因为这里
-                    // 拿到的永远是 MainWindow;可接受,不做进一步区分。
-                    // 每次点击都会触发,不写事件日志,避免刷屏。
-                    Activate();
-                    return;
-                }
-                Log($"[{f}] 交互上报: {action} {payload}");
+                // 子窗口现在是 WS_EX_NOACTIVATE,点击不会自己抢激活/提 Z 序,
+                // 这里补偿式地把主窗口(宿主)激活一下,换取"点了有反应"的体验。
+                // 注:浮动窗格场景下激活的是主窗口而非浮动窗口本身,因为这里
+                // 拿到的永远是 MainWindow;可接受,不做进一步区分。
+                // 每次点击都会触发,不写事件日志,避免刷屏。
+                Activate();
             });
 
-        _coordinator.PongReceived += (f, seq, rtt) =>
+        _hub.FeatureLog += (f, message) =>
+            Dispatcher.BeginInvoke(() => Log($"[{f}] {message}"));
+
+        _hub.PongReceived += (f, seq, rtt) =>
             Dispatcher.BeginInvoke(() => _status.Text =
                 $"心跳 #{seq} [{f}] UI 线程往返 {rtt:F0} ms    {DateTime.Now:HH:mm:ss}");
 
-        _coordinator.UiUnresponsive += (f, ms) =>
+        _hub.UiUnresponsive += (f, ms) =>
             Dispatcher.BeginInvoke(() =>
             {
                 Log($"[{f}] ⚠ UI 线程无响应 ({ms / 1000.0:F1} 秒无 Pong)");
@@ -178,7 +179,7 @@ public sealed class MainWindow : Window
                 _status.Text = $"[{f}] UI 线程无响应 ({ms / 1000.0:F1} 秒无 Pong)    {DateTime.Now:HH:mm:ss}";
             });
 
-        _coordinator.UiRecovered += f =>
+        _hub.UiRecovered += f =>
             Dispatcher.BeginInvoke(() =>
             {
                 Log($"[{f}] UI 线程已恢复");
@@ -188,6 +189,12 @@ public sealed class MainWindow : Window
 
     private void LaunchChild(string featureId)
     {
+        // session_id 由主进程生成、当启动参数传给子进程(不再靠子进程 Register RPC 换取);
+        // Prepare 预登记这个 session_id 属于哪个 feature,子进程开自己 feature 的流时
+        // SessionHub.TryOpen 据此校验。
+        string sessionId = Guid.NewGuid().ToString();
+        _hub.Prepare(sessionId, featureId);
+
         var exe = Environment.ProcessPath!;
         var psi = new ProcessStartInfo(exe)
         {
@@ -195,6 +202,7 @@ public sealed class MainWindow : Window
         };
         psi.ArgumentList.Add("--child");
         psi.ArgumentList.Add($"--feature={featureId}");
+        psi.ArgumentList.Add($"--session={sessionId}");
         psi.ArgumentList.Add($"--socket={_socketPath}");
         psi.ArgumentList.Add($"--hostpid={Environment.ProcessId}");
 
@@ -211,7 +219,7 @@ public sealed class MainWindow : Window
 
     private void ShutdownChildren()
     {
-        _coordinator.PushShutdownAll();
+        _hub.PushShutdownAll();
         foreach (var proc in _children.Values)
         {
             try

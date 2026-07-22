@@ -23,6 +23,6 @@ public static class ChildProgram
         }
 
         var app = new Application { ShutdownMode = ShutdownMode.OnMainWindowClose };
-        app.Run(new ChildWindow(opts));
+        app.Run(new ChildShell(opts, new ChildFeatureRegistry()));
     }
 }
