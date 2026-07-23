@@ -10,11 +10,12 @@ public sealed record SessionLaunchOptions(string ExecutablePath, string SocketPa
 
 /// <summary>
 /// 会话层核心(演进自原 SessionHub,原地改名并承担了原来 MainWindow.LaunchChild +
-/// HostFeatureRegistry 的职责):调库方注册好 <see cref="IFeatureHost"/> 列表和一个
-/// <see cref="IDockWorkspace"/> 实现之后,"开一个 feature 实例"这件事(分配
-/// featureIndex/session_id、造 OverlayHost、建 dock pane、拉起子进程、预登记)由
-/// <see cref="OpenFeature"/> 一次调用完成,支持同一 feature 反复调用多开出独立的
-/// 会话/独立的子进程。
+/// HostFeatureRegistry 的职责):调库方注册好 <see cref="IFeatureHost"/> 列表之后,
+/// "开一个 feature 实例"这件事(生成 session_id、造 OverlayHost、拉起子进程、预登记)
+/// 由 <see cref="OpenFeature"/> 一次调用完成——featureIndex 和 <see cref="IDockPane"/>
+/// 都由调用方自己决定/造好再传进来(不再有 IDockWorkspace 这层,SessionManager 不
+/// 负责"造 pane"),支持同一 feature 反复调用多开出独立的会话/独立的子进程,但同一
+/// (featureId, featureIndex) 不能同时有两个活跃会话。
 ///
 /// 会话建立的顺序整个反过来了:<see cref="OpenFeature"/> 这时候还不知道具体
 /// feature 的 Session 长什么样(<see cref="IFeatureHost"/> 已经不再有
@@ -41,14 +42,12 @@ public sealed class SessionManager : IDisposable
         public Session? Session { get; set; }
     }
 
-    private readonly IDockWorkspace _dock;
     private readonly SessionLaunchOptions _launch;
     private readonly IReadOnlyList<IFeatureHost> _features;
 
     private readonly ConcurrentDictionary<string, SessionEntry> _entries = new();     // sessionId -> entry(预登记/已连接都在这)
     private readonly ConcurrentDictionary<string, Session> _connected = new();        // sessionId -> 已连接的会话(心跳循环只认这个非泛型基类)
     private readonly ConcurrentDictionary<string, long> _lastPongMs = new();
-    private readonly ConcurrentDictionary<string, int> _nextFeatureIndex = new();     // featureId -> 下一个可用 index
     private readonly HashSet<string> _unresponsive = [];
     private readonly Lock _unresponsiveLock = new();
     private readonly CancellationTokenSource _cts = new();
@@ -73,9 +72,8 @@ public sealed class SessionManager : IDisposable
     public event Action<string, string>? FeatureLog;
     public event Action<string, string, UiStatsRequest>? UiStatsReceived; // sessionId, featureId, stats
 
-    public SessionManager(IDockWorkspace dock, SessionLaunchOptions launch, IReadOnlyList<IFeatureHost> features)
+    public SessionManager(SessionLaunchOptions launch, IReadOnlyList<IFeatureHost> features)
     {
-        _dock = dock;
         _launch = launch;
         _features = features;
         _ = HeartbeatLoopAsync(_cts.Token);
@@ -83,28 +81,33 @@ public sealed class SessionManager : IDisposable
 
     private static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-    /// <summary>打开一个 feature 的新实例:分配 featureIndex(该 feature 下递增)、生成
-    /// session_id、造 OverlayHost、经 IDockWorkspace 建 dock pane、拉起子进程、预登记
-    /// (这时候还没有具体的 Session 对象,等子进程连上来 Register 才会有)。同一个
-    /// featureId 可以反复调用,每次都是独立的会话。</summary>
-    public OverlayHost OpenFeature(string featureId)
+    /// <summary>打开一个 feature 的新实例:调用方(demo 里是 MainWindow)自己决定
+    /// featureIndex 并造好一个 IDockPane 传进来——同一 (featureId, featureIndex) 不能
+    /// 有第二个活跃会话,重复会直接抛 InvalidOperationException(调用方的计数器逻辑
+    /// 有 bug 才会走到这里,不是运行时可恢复的场景)。生成 session_id、造
+    /// OverlayHost、把它塞进 pane、拉起子进程、预登记(这时候还没有具体的 Session
+    /// 对象,等子进程连上来 Register 才会有)。</summary>
+    public OverlayHost OpenFeature(string featureId, int featureIndex, IDockPane pane)
     {
         var feature = _features.FirstOrDefault(f => f.FeatureId == featureId)
             ?? throw new ArgumentException($"未注册的 featureId: {featureId}", nameof(featureId));
 
-        int index = _nextFeatureIndex.AddOrUpdate(featureId, 0, (_, cur) => cur + 1);
+        if (_entries.Values.Any(e => e.FeatureId == featureId && e.FeatureIndex == featureIndex))
+            throw new InvalidOperationException(
+                $"featureId={featureId} featureIndex={featureIndex} 已经存在一个活跃会话,不能重复 OpenFeature");
+
         string sessionId = Guid.NewGuid().ToString();
 
         var overlay = new OverlayHost();
-        var pane = _dock.AddPane(sessionId, $"{feature.Descriptor.Title} #{index}", overlay);
+        pane.SetContent(overlay);
 
         var entry = new SessionEntry
         {
             FeatureId = featureId,
-            FeatureIndex = index,
+            FeatureIndex = featureIndex,
             Overlay = overlay,
             Pane = pane,
-            Process = StartChildProcess(featureId, sessionId, index),
+            Process = StartChildProcess(featureId, sessionId, featureIndex),
         };
         _entries[sessionId] = entry;
 
@@ -113,12 +116,12 @@ public sealed class SessionManager : IDisposable
         entry.Process.EnableRaisingEvents = true;
         entry.Process.Exited += (_, _) =>
         {
-            FeatureLog?.Invoke($"{featureId}#{index}", $"子进程退出 (code {SafeExitCode(entry.Process)})");
+            FeatureLog?.Invoke($"{featureId}#{featureIndex}", $"子进程退出 (code {SafeExitCode(entry.Process)})");
             CloseSession(sessionId);
         };
 
-        SessionOpened?.Invoke(sessionId, featureId, index);
-        FeatureLog?.Invoke($"{featureId}#{index}", $"已启动子进程 pid {entry.Process.Id}");
+        SessionOpened?.Invoke(sessionId, featureId, featureIndex);
+        FeatureLog?.Invoke($"{featureId}#{featureIndex}", $"已启动子进程 pid {entry.Process.Id}");
         return overlay;
     }
 

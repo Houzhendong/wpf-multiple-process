@@ -14,11 +14,12 @@ using WpfMultiProcess.Ipc;
 
 namespace WpfMultiProcess.Demo.Host;
 
-/// <summary>主进程入口:先建 MainWindow(只搭 UI 外壳,暴露 IDockWorkspace),用它
-/// 造 SessionManager,再起 Kestrel(gRPC over UDS,同一通道上挂 CommonService + 每个
-/// feature 自己的 service,构造函数都吃同一个 SessionManager 单例),最后回调
-/// MainWindow.AttachSessionManager 接上事件、自动打开 waveform/table 各一个实例、
-/// 跑 WPF 消息循环。</summary>
+/// <summary>主进程入口:先建 MainWindow(只搭 UI 外壳),再造 SessionManager(不再
+/// 需要 MainWindow 的任何东西——featureIndex/IDockPane 现在由 MainWindow 在
+/// OpenFeatureInstance 里自己决定/建好再传给 OpenFeature),然后起 Kestrel(gRPC over
+/// UDS,同一通道上挂 CommonService + 每个 feature 自己的 service,构造函数都吃同一个
+/// SessionManager 单例),最后回调 MainWindow.AttachSessionManager 接上事件、自动
+/// 打开 waveform/table 各一个实例、跑 WPF 消息循环。</summary>
 public static class HostProgram
 {
     public static void Run()
@@ -31,7 +32,7 @@ public static class HostProgram
 
         var window = new MainWindow();
         var launch = new SessionLaunchOptions(Environment.ProcessPath!, socketPath);
-        var sessionManager = new SessionManager(window.Workspace, launch, features);
+        var sessionManager = new SessionManager(launch, features);
 
         var builder = WebApplication.CreateBuilder();
         builder.Logging.ClearProviders();

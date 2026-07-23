@@ -14,12 +14,13 @@ using WpfMultiProcess.Ipc.Common;
 namespace WpfMultiProcess.Demo.Host;
 
 /// <summary>主窗口:VS 风格 DockingManager,dock pane 完全动态——不再预置固定 tab,
-/// 每次 SessionManager.OpenFeature 都经 AvalonDockWorkspace 现建一个 LayoutDocument。
-/// 两段式初始化:构造函数只搭 UI 外壳(dock/log/status bar)并暴露
-/// <see cref="Workspace"/>,HostProgram 拿它去 new SessionManager,再回调
-/// <see cref="AttachSessionManager"/> 接上事件、首次自动打开 waveform/table、挂
-/// Closing→CloseAll——这样 SessionManager 需要的 IDockWorkspace 和 DI 容器需要的
-/// SessionManager 单例之间不会出现构造顺序死锁。</summary>
+/// 每次开一个 feature 实例都是 MainWindow 自己现建一个 LayoutDocument + AvalonDockPane
+/// (见 <see cref="OpenFeatureInstance"/>),再调 SessionManager.OpenFeature 把
+/// featureIndex 和造好的 pane 一起传进去——featureIndex 由 <see cref="_nextIndex"/>
+/// 按 featureId 各自维护,菜单多开第二个同 feature 实例时自然递增。两段式初始化:
+/// 构造函数只搭 UI 外壳(dock/log/status bar),HostProgram 先 new SessionManager
+/// (不再需要 MainWindow 这边任何东西),再回调 <see cref="AttachSessionManager"/>
+/// 接上事件、首次自动打开 waveform/table、挂 Closing→CloseAll。</summary>
 public sealed class MainWindow : Window
 {
     private readonly ObservableCollection<string> _log = new();
@@ -31,6 +32,14 @@ public sealed class MainWindow : Window
     private readonly Dictionary<string, bool> _uiStatsHigh = new();
     private readonly Dictionary<string, long> _uiStatsLastLogMs = new();
     private readonly Dictionary<string, int> _sessionIndex = new();
+    // featureId -> 下一个可用 featureIndex,多开菜单自己维护(SessionManager 不再
+    // 分配 index,由调用方决定并传入 OpenFeature)。
+    private readonly Dictionary<string, int> _nextIndex = new();
+    private static readonly Dictionary<string, string> FeatureTitles = new()
+    {
+        ["waveform"] = "实时波形",
+        ["table"] = "数据表格",
+    };
     private static readonly SolidColorBrush StatusBarNormalBrush = new(Color.FromRgb(0x00, 0x7A, 0xCC));
     private static readonly SolidColorBrush StatusBarUnresponsiveBrush = new(Color.FromRgb(0xC4, 0x2B, 0x1E));
     /// <summary>持续高位判定阈值:探针 saturation_pct 超过这个百分比才算"饱和",
@@ -46,10 +55,6 @@ public sealed class MainWindow : Window
 
     private SessionManager? _sessionManager;
 
-    /// <summary>HostProgram 拿这个去 new SessionManager——先于 SessionManager 存在,
-    /// 因为 AvalonDock 的 LayoutDocumentPane 在这里的构造函数里就已经建好了。</summary>
-    public IDockWorkspace Workspace { get; }
-
     public MainWindow()
     {
         Title = $"WpfMultiProcess Demo 主进程 (pid {Environment.ProcessId})";
@@ -58,7 +63,6 @@ public sealed class MainWindow : Window
 
         _dockingManager = new DockingManager { Theme = new Vs2013DarkTheme() };
         _docPane = new LayoutDocumentPane();
-        Workspace = new AvalonDockWorkspace(_docPane);
 
         _statusBar = BuildStatusBar();
         Content = BuildLayout();
@@ -83,9 +87,28 @@ public sealed class MainWindow : Window
         Loaded += (_, _) =>
         {
             foreach (var featureId in autoOpenFeatureIds)
-                sessionManager.OpenFeature(featureId);
+                OpenFeatureInstance(featureId);
         };
         Closing += (_, _) => sessionManager.CloseAll();
+    }
+
+    /// <summary>多开一个 feature 新实例:自己维护每个 featureId 的下一个 index、
+    /// 建一个新的 LayoutDocument 加进 _docPane、包成 AvalonDockPane,再连同 index/pane
+    /// 一起交给 SessionManager.OpenFeature——同一个 featureId 反复调用会递增出
+    /// #0、#1、#2……独立的会话。</summary>
+    private void OpenFeatureInstance(string featureId)
+    {
+        if (_sessionManager is null) return;
+
+        int index = _nextIndex.TryGetValue(featureId, out var cur) ? cur + 1 : 0;
+        _nextIndex[featureId] = index;
+
+        string title = FeatureTitles.TryGetValue(featureId, out var t) ? t : featureId;
+        var document = new LayoutDocument { Title = $"{title} #{index}", ContentId = Guid.NewGuid().ToString() };
+        _docPane.Children.Add(document);
+        var pane = new AvalonDockPane(document);
+
+        _sessionManager.OpenFeature(featureId, index, pane);
     }
 
     private void ToggleFloatDock()
@@ -143,9 +166,9 @@ public sealed class MainWindow : Window
         };
 
         var newWaveform = new Button { Content = "新建波形", Margin = new Thickness(6, 4, 0, 4), Padding = new Thickness(10, 3, 10, 3) };
-        newWaveform.Click += (_, _) => _sessionManager?.OpenFeature("waveform");
+        newWaveform.Click += (_, _) => OpenFeatureInstance("waveform");
         var newTable = new Button { Content = "新建表格", Margin = new Thickness(6, 4, 0, 4), Padding = new Thickness(10, 3, 10, 3) };
-        newTable.Click += (_, _) => _sessionManager?.OpenFeature("table");
+        newTable.Click += (_, _) => OpenFeatureInstance("table");
 
         var toolbar = new StackPanel { Orientation = Orientation.Horizontal };
         toolbar.Children.Add(newWaveform);
