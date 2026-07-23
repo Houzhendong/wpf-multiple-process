@@ -1,4 +1,5 @@
 using System.Windows;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using WpfMultiProcess.Child;
 using WpfMultiProcess.Demo.Child.Features.Table;
@@ -23,10 +24,14 @@ public static class Program
             // ChildProgram.Run 只把这个 IHost 当 DI/日志容器用(WPF 消息循环仍由它内部的
             // Application.Run 驱动,不靠 IHost 的 hosted service 生命周期),所以这里
             // 不需要注册任何 hosted service,只挂日志——AddDebug() 输出到 Visual Studio
-            // "输出"窗口,子进程是 WinExe 无控制台,不用 Console provider。
+            // "输出"窗口,子进程是 WinExe 无控制台,不用 Console provider。Application
+            // 也从这个容器里取(ChildProgram 不自己 new)——demo 没有额外资源要初始化,
+            // 这里就是最简单的 new Application,换成别的调库方可以在这注册自己的
+            // Application 子类/ResourceDictionary。
             var hostBuilder = GenericHost.CreateApplicationBuilder();
             hostBuilder.Logging.ClearProviders();
             hostBuilder.Logging.AddDebug();
+            hostBuilder.Services.AddSingleton(new Application { ShutdownMode = ShutdownMode.OnMainWindowClose });
             var host = hostBuilder.Build();
 
             // ChildProgram.Run 拥有 host 的生命周期(Start/StopAsync/Dispose 都在它内部

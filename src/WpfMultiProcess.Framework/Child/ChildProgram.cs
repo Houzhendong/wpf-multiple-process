@@ -11,10 +11,14 @@ namespace WpfMultiProcess.Child;
 /// 子进程通用入口:宿主应用自己解析命令行、判断"这是不是子进程"之后,把结果拼成
 /// <see cref="ChildStartOptions"/>、自己注册的 <see cref="IFeatureChild"/> 列表,连同一个
 /// 自己造好的 <see cref="IHost"/>(典型用法是 <c>Host.CreateApplicationBuilder()</c> 接
-/// 上想要的日志 provider 后 Build())一起交给 <see cref="Run"/>。这个 IHost 只当 DI/日志
-/// 容器用——WPF 消息循环仍然是这里的 <c>Application.Run</c> 在跑,不委托给 IHost 的
-/// hosted service 生命周期,所以只需要 <see cref="IHost.Start"/>/<see cref="IHost.StopAsync"/>
-/// 让容器就绪/收尾,不需要 IHostedService。
+/// 上想要的日志 provider、注册好一个 <see cref="Application"/> 单例后 Build())一起交给
+/// <see cref="Run"/>。这个 IHost 首先是 DI/日志容器——WPF 消息循环仍然是这里的
+/// <c>Application.Run</c> 在跑,不委托给 IHost 的 hosted service 生命周期,所以只需要
+/// <see cref="IHost.Start"/>/<see cref="IHost.StopAsync"/> 让容器就绪/收尾,不需要
+/// IHostedService。同时它也是 <see cref="Application"/> 实例的来源——这里不自己
+/// <c>new Application()</c>,而是从 <c>host.Services.GetRequiredService&lt;Application&gt;()</c>
+/// 取,好让调库方在自己的 Program.cs 里按需要注册自定义 Application 子类/附加资源
+/// (ResourceDictionary、全局异常处理等),框架不替调库方决定这些。
 ///
 /// 这里负责:孤儿自杀看护(主进程意外死亡时自己退出,避免留下摸不到主进程、又没人管
 /// 的孤儿子进程——和 FeatureViewModel 流断开时关窗口是两道独立的保险)、拉起
@@ -78,7 +82,10 @@ public static class ChildProgram
         var window = new ChildWindow();
         window.SourceReady += () => Bootstrap(window, opts, feature, loggerFactory, logger);
 
-        var app = new Application { ShutdownMode = ShutdownMode.OnMainWindowClose };
+        // Application 不在这里 new——从 host.Services 里取,让调库方(典型是自己的
+        // Program.cs)决定怎么构造/配置它,方便附加自己的资源(ResourceDictionary、
+        // 自定义 Application 子类等)。框架只负责跑 Application.Run(window)。
+        var app = host.Services.GetRequiredService<Application>();
         app.Run(window);
     }
 
