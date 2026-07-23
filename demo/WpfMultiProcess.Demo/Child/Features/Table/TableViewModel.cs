@@ -49,8 +49,11 @@ public sealed class TableViewModel : FeatureViewModel<TableDown>
             case TableDown.KindOneofCase.Reply:
                 OnReply(env.Reply);
                 break;
-            case TableDown.KindOneofCase.Control:
-                HandleControl(env.Control);
+            case TableDown.KindOneofCase.Ping:
+                HandlePing(env.Ping);
+                break;
+            case TableDown.KindOneofCase.Shutdown:
+                HandleShutdown(env.Shutdown);
                 break;
             case TableDown.KindOneofCase.Delta:
                 Shell.Window.Dispatcher.BeginInvoke(() => OnData(env));

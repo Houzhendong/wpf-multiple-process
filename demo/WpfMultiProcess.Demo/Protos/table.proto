@@ -6,7 +6,7 @@ package ipc.table;
 
 import "common.proto";
 
-// table feature 专属 service:会话建立(带 hwnd/pid)+ 数据流(Reply/Control/Delta
+// table feature 专属 service:会话建立(带 hwnd/pid)+ 数据流(Reply/Ping/Shutdown/Delta
 // 共用一个 envelope)+ 一个 feature 专属 unary(排序)。
 service TableService {
   rpc Register (StreamRequest) returns (stream TableDown);
@@ -21,9 +21,10 @@ message StreamRequest {
 
 message TableDown {
   oneof kind {
-    ipc.common.RegisterReply reply = 1;  // 会话建立后第一条:标题/主题色/设置
-    ipc.common.Control control = 2;      // 心跳 Ping / Shutdown
-    TableDelta delta = 3;                // 业务数据帧
+    ipc.common.RegisterReply reply = 1;   // 会话建立后第一条:标题/主题色/设置
+    ipc.common.Ping ping = 2;             // 心跳
+    ipc.common.Shutdown shutdown = 3;     // 关闭(带 reason)
+    TableDelta delta = 4;                 // 业务数据帧
   }
 }
 

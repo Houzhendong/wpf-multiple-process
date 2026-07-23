@@ -17,7 +17,9 @@ public sealed class WaveformSession : Session<WaveformDown>
     private double _min = double.MaxValue, _max = double.MinValue, _sum;
 
     public WaveformSession(string sessionId, string featureId, int featureIndex)
-        : base(sessionId, featureId, featureIndex, control => new WaveformDown { Control = control })
+        : base(sessionId, featureId, featureIndex,
+            ping => new WaveformDown { Ping = ping },
+            shutdown => new WaveformDown { Shutdown = shutdown })
     {
     }
 

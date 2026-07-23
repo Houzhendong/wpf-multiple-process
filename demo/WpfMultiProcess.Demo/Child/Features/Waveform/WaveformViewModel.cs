@@ -60,8 +60,11 @@ public sealed class WaveformViewModel : FeatureViewModel<WaveformDown>
             case WaveformDown.KindOneofCase.Reply:
                 OnReply(env.Reply);
                 break;
-            case WaveformDown.KindOneofCase.Control:
-                HandleControl(env.Control);
+            case WaveformDown.KindOneofCase.Ping:
+                HandlePing(env.Ping);
+                break;
+            case WaveformDown.KindOneofCase.Shutdown:
+                HandleShutdown(env.Shutdown);
                 break;
             case WaveformDown.KindOneofCase.Frame:
                 Shell.Window.Dispatcher.BeginInvoke(() => OnData(env));

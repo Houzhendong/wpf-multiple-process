@@ -6,7 +6,7 @@ package ipc.waveform;
 
 import "common.proto";
 
-// waveform feature 专属 service:会话建立(带 hwnd/pid)+ 数据流(Reply/Control/Frame
+// waveform feature 专属 service:会话建立(带 hwnd/pid)+ 数据流(Reply/Ping/Shutdown/Frame
 // 共用一个 envelope)+ 一个 feature 专属 unary(取统计值)。
 service WaveformService {
   rpc Register (StreamRequest) returns (stream WaveformDown);
@@ -14,8 +14,8 @@ service WaveformService {
 }
 
 // 开流即建会话:session_id 由主进程生成、当启动参数传给子进程;hwnd/pid 随开流
-// 请求一起带上,主进程据此 SessionHub.TryOpen 校验 + 触发 overlay,不再需要单独一次
-// RegisterWindow RPC。
+// 请求一起带上,主进程据此 SessionManager.Register 校验 + 触发 overlay,不再需要单独
+// 一次 RegisterWindow RPC。
 message StreamRequest {
   string session_id = 1;
   int64 hwnd = 2;
@@ -24,9 +24,10 @@ message StreamRequest {
 
 message WaveformDown {
   oneof kind {
-    ipc.common.RegisterReply reply = 1;  // 会话建立后第一条:标题/主题色/设置
-    ipc.common.Control control = 2;      // 心跳 Ping / Shutdown
-    WaveformFrame frame = 3;             // 业务数据帧
+    ipc.common.RegisterReply reply = 1;   // 会话建立后第一条:标题/主题色/设置
+    ipc.common.Ping ping = 2;             // 心跳
+    ipc.common.Shutdown shutdown = 3;     // 关闭(带 reason)
+    WaveformFrame frame = 4;              // 业务数据帧
   }
 }
 

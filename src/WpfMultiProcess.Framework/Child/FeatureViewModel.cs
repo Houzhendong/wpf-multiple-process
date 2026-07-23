@@ -35,18 +35,17 @@ public abstract class FeatureViewModel : INotifyPropertyChanged, IDisposable
 
     private protected abstract Task RunAsync(CancellationToken ct);
 
-    /// <summary>Ping→回 Pong(在 UI 线程,证明 UI 未卡死);Shutdown→关子窗口。</summary>
-    protected void HandleControl(Control control)
+    /// <summary>Ping→回 Pong(在 UI 线程,证明 UI 未卡死)。proto 里 Control 包装已经去掉,
+    /// Ping/Shutdown 现在是 XxxDown 的两个独立 oneof 分支,子类的 Dispatch 分派要各自
+    /// 落到这两个方法上。</summary>
+    protected void HandlePing(Ping ping) => Shell.SendPong(ping);
+
+    /// <summary>Shutdown→关子窗口。reason 只用于诊断日志(M5 会接入 ILogger 后此处改为
+    /// 结构化输出),不影响"收到就关窗口"这个行为本身。</summary>
+    protected void HandleShutdown(Shutdown shutdown)
     {
-        switch (control.KindCase)
-        {
-            case Control.KindOneofCase.Ping:
-                Shell.SendPong(control.Ping);
-                break;
-            case Control.KindOneofCase.Shutdown:
-                Shell.RequestClose();
-                break;
-        }
+        System.Diagnostics.Debug.WriteLine($"[FeatureViewModel] Shutdown reason={shutdown.Reason} detail={shutdown.Detail}");
+        Shell.RequestClose();
     }
 
     /// <summary>Register 流第一条 Reply 落地时调用,默认设标题/主题色;override 时记得

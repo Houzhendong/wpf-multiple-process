@@ -30,7 +30,9 @@ public sealed class TableSession : Session<TableDown>
     private Task? _produceTask;
 
     public TableSession(string sessionId, string featureId, int featureIndex)
-        : base(sessionId, featureId, featureIndex, control => new TableDown { Control = control })
+        : base(sessionId, featureId, featureIndex,
+            ping => new TableDown { Ping = ping },
+            shutdown => new TableDown { Shutdown = shutdown })
     {
     }
 

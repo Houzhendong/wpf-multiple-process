@@ -56,19 +56,28 @@ message Ack {
   bool ok = 1;
 }
 
-// 共享的控制消息:搭在每个 feature 自己的 stream 的 oneof envelope(XxxDown)里,
-// 而不是单开一条 stream。
+// 共享的心跳消息,直接搭在每个 feature 自己的 stream 的 oneof envelope(XxxDown)里。
+// 原来还有一层 Control{ping/shutdown} 包装,现已去掉——Ping/Shutdown 直接作为 oneof
+// 分支暴露,少一层 demux,也方便调库方在自己的 envelope 里按需只暴露其中一个。
 message Ping {
   int64 seq = 1;
   int64 timestamp_ms = 2;
 }
 
-message Shutdown {
+// 会话关闭的触发源,尽量覆盖框架已知的所有关闭路径,方便子进程侧诊断/埋点区分
+// "我是被谁关掉的"。子进程侧只需要行为一致地关窗口,reason 仅用于日志/可观测性。
+enum ShutdownReason {
+  SHUTDOWN_REASON_UNSPECIFIED = 0;
+  SHUTDOWN_REASON_HOST_CLOSING = 1;     // 主窗口关闭,全体退出
+  SHUTDOWN_REASON_PANE_CLOSED = 2;      // 用户关闭了这个 pane
+  SHUTDOWN_REASON_CLOSED_BY_API = 3;    // 调库方代码主动 CloseSession
+  SHUTDOWN_REASON_SESSION_REJECTED = 4; // Register 校验失败被拒
+  SHUTDOWN_REASON_REPLACED = 5;         // 同 session 重复连接被顶掉
+  SHUTDOWN_REASON_HOST_ERROR = 6;       // 主进程内部错误
+  SHUTDOWN_REASON_RESTARTING = 7;       // 预留:重启/升级
 }
 
-message Control {
-  oneof kind {
-    Ping ping = 1;
-    Shutdown shutdown = 2;
-  }
+message Shutdown {
+  ShutdownReason reason = 1;
+  string detail = 2;
 }

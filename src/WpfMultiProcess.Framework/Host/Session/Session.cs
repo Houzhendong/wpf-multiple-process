@@ -9,6 +9,11 @@ namespace WpfMultiProcess.Host.Session;
 /// <see cref="SendClose"/> 两个不感知具体 envelope 类型的方法——真正的写入由
 /// <see cref="Session{TDown}"/> 经 <c>Subscription&lt;TDown&gt;</c> 实现。
 ///
+/// M1 阶段:proto 侧的 Control{ping/shutdown} 包装已经去掉,Ping/Shutdown 直接是
+/// XxxDown 的 oneof 分支,这里的接缝相应拆成 <see cref="WritePing"/>/
+/// <see cref="WriteShutdown"/> 两个。完整的"非泛型 Session + IDisposable + 会话建立
+/// 反转"是后续里程碑的事,这一步只保证 proto 改动后能编译、语义不变。
+///
 /// 生命周期虚方法(<see cref="OnConnected"/>/<see cref="OnPong"/>/<see cref="OnUiStats"/>/
 /// <see cref="OnDisconnected"/>)供调库方在自己的 Session 子类里 override,承接原来散落在
 /// SessionHub/各 ServiceImpl 里的"会话连上了/收到 Pong 了/该起 producer 了"这类时机。
@@ -36,17 +41,19 @@ public abstract class Session
         FeatureIndex = featureIndex;
     }
 
-    /// <summary>把会话层的 Control(Ping/Shutdown)包装成本会话 feature 自己的 envelope
-    /// 类型再写入 stream——具体包装/写入由 <see cref="Session{TDown}"/> 经
-    /// Subscription&lt;TDown&gt; 完成,这里只声明接缝,仅框架内部(SessionManager 的
-    /// 心跳循环/PushShutdownAll)调用。</summary>
-    internal abstract void WriteControl(Control control);
+    /// <summary>把心跳 Ping 包装成本会话 feature 自己的 envelope 类型再写入 stream——
+    /// 具体包装/写入由 <see cref="Session{TDown}"/> 经 Subscription&lt;TDown&gt; 完成,
+    /// 这里只声明接缝,仅框架内部(SessionManager 的心跳循环)调用。</summary>
+    internal abstract void WritePing(Ping ping);
+
+    /// <summary>同上,包装 Shutdown。</summary>
+    internal abstract void WriteShutdown(Shutdown shutdown);
 
     /// <summary>心跳:SessionManager 心跳循环里对每个会话调用。</summary>
-    public void SendHeartbeat(Ping ping) => WriteControl(new Control { Ping = ping });
+    public void SendHeartbeat(Ping ping) => WritePing(ping);
 
     /// <summary>关闭:CloseSession / 主窗口关闭时对每个会话调用。</summary>
-    public void SendClose() => WriteControl(new Control { Shutdown = new Shutdown() });
+    public void SendClose() => WriteShutdown(new Shutdown());
 
     /// <summary>子进程开流请求 TryOpen 校验通过、hwnd 落地时调用(SessionManager 内部)。
     /// 典型用途:调库方在这里启动自己的数据 producer。</summary>
@@ -69,26 +76,28 @@ public abstract class Session
 /// <see cref="PushData"/> 推自己的业务数据帧,也自动获得心跳/关闭包装。
 ///
 /// 持有一个 <see cref="Subscription{TDown}"/> 引用(子进程开流、TryOpen 校验通过后由
-/// SessionManager 绑定上来,见 <see cref="AttachSubscription"/>)和一个
-/// wrapControl 委托——这正是主进程侧"把 Control 包成 TDown"的接缝,SessionManager
-/// 本身完全不感知 TDown 是什么类型。
+/// SessionManager 绑定上来,见 <see cref="AttachSubscription"/>)和两个 wrap 委托——
+/// 这正是主进程侧"把 Ping/Shutdown 包成 TDown"的接缝,SessionManager 本身完全不感知
+/// TDown 是什么类型。
 /// </summary>
 public abstract class Session<TDown> : Session
 {
-    private readonly Func<Control, TDown> _wrapControl;
+    private readonly Func<Ping, TDown> _wrapPing;
+    private readonly Func<Shutdown, TDown> _wrapShutdown;
     private Subscription<TDown>? _subscription;
 
-    protected Session(string sessionId, string featureId, int featureIndex, Func<Control, TDown> wrapControl)
+    protected Session(string sessionId, string featureId, int featureIndex,
+        Func<Ping, TDown> wrapPing, Func<Shutdown, TDown> wrapShutdown)
         : base(sessionId, featureId, featureIndex)
     {
-        _wrapControl = wrapControl;
+        _wrapPing = wrapPing;
+        _wrapShutdown = wrapShutdown;
     }
 
-    /// <summary>SessionManager.TryOpen&lt;TDown&gt; 里调用:本 Session 是自己 wrapControl
-    /// 委托的唯一持有者,由它现造一个新的 Subscription&lt;TDown&gt;(session_id/featureId
-    /// 随会话本身,wrap 委托随 Session 子类的构造),SessionManager 自己完全不需要
+    /// <summary>SessionManager.TryOpen&lt;TDown&gt; 里调用:本 Session 是自己 wrap 委托的
+    /// 唯一持有者,由它现造一个新的 Subscription&lt;TDown&gt;,SessionManager 自己完全不需要
     /// 知道 TDown 的 wrap 规则是什么。</summary>
-    internal Subscription<TDown> CreateSubscription() => new(SessionId, FeatureId, _wrapControl);
+    internal Subscription<TDown> CreateSubscription() => new(SessionId, FeatureId);
 
     /// <summary>SessionManager.TryOpen 里,子进程开流请求校验通过后调用,把这个会话
     /// 接下来的推流通道接上。</summary>
@@ -102,7 +111,9 @@ public abstract class Session<TDown> : Session
             _subscription = null;
     }
 
-    internal override void WriteControl(Control control) => _subscription?.WriteControl(control);
+    internal override void WritePing(Ping ping) => _subscription?.WriteData(_wrapPing(ping));
+
+    internal override void WriteShutdown(Shutdown shutdown) => _subscription?.WriteData(_wrapShutdown(shutdown));
 
     /// <summary>调库方在自己的 producer 里调用,推一帧业务数据。会话还没建立(子进程未连接)
     /// 或已断开时静默丢弃——同 Subscription 本身"满了丢最旧帧"的降级哲学一致。</summary>
