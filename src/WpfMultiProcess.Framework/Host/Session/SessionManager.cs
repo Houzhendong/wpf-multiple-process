@@ -141,8 +141,16 @@ public sealed class SessionManager : IDisposable
         if (!_entries.TryRemove(sessionId, out var entry)) return;
 
         entry.Session.SendClose();
-        try { entry.Pane.Close(); } catch { /* 可能已经在关闭中(正是这次调用的触发源) */ }
-        entry.Overlay.DetachChild();
+        // CloseSession 的调用方里,pane.Closed(用户点关闭)和 CloseAll(主窗口关闭)
+        // 都在 UI 线程,但 Process.Exited(子进程自己退出/被杀)来自线程池——Pane.Close()
+        // /Overlay.DetachChild() 都会碰 UI 线程独占的 WPF 对象(AvalonDock LayoutDocument/
+        // OverlayHost),统一调度回 UI 线程最安全,哪怕调用方本来就在 UI 线程上也只是
+        // 多一次 BeginInvoke,无副作用。
+        entry.Overlay.Dispatcher.BeginInvoke(() =>
+        {
+            try { entry.Pane.Close(); } catch { /* 可能已经在关闭中(正是这次调用的触发源) */ }
+            entry.Overlay.DetachChild();
+        });
 
         _ = KillIfStillRunningAsync(entry.Process);
         SessionClosed?.Invoke(sessionId, entry.FeatureId);
@@ -193,7 +201,12 @@ public sealed class SessionManager : IDisposable
 
         SessionConnected?.Invoke(sessionId, featureId, pid);
         WindowRegistered?.Invoke(sessionId, featureId, hwnd);
-        entry.Overlay.AttachChild(hwnd);
+        // TryOpen 在 gRPC 线程池线程上执行,OverlayHost 是 UI 线程的 DependencyObject
+        // (Border),必须调度回它自己的 Dispatcher 才能碰它——这里不同步等待(fire-and-
+        // forget BeginInvoke),和旧 SessionHub 时代 MainWindow 订阅 WindowRegistered 后
+        // 用 Dispatcher.BeginInvoke 调 AttachChild 的方式一致。OnConnected 不碰任何 UI
+        // 对象(典型实现只起一个后台 producer),线程无关,原样同步调用即可。
+        entry.Overlay.Dispatcher.BeginInvoke(() => entry.Overlay.AttachChild(hwnd));
         typedSession.OnConnected(hwnd);
         return true;
     }
@@ -217,7 +230,9 @@ public sealed class SessionManager : IDisposable
         {
             if (entry.Session is Session<TDown> typedSession)
                 typedSession.DetachSubscription(sub);
-            entry.Overlay.DetachChild();
+            // 同 TryOpen:DetachStream 也来自 gRPC 线程池,DetachChild 摸的是 UI 线程的
+            // OverlayHost,必须调度回它的 Dispatcher;OnDisconnected 线程无关,同步调用。
+            entry.Overlay.Dispatcher.BeginInvoke(() => entry.Overlay.DetachChild());
             entry.Session.OnDisconnected();
             SessionDisconnected?.Invoke(sub.SessionId, sub.FeatureId);
         }
