@@ -1,13 +1,18 @@
+using System.IO;
+using System.Threading.Channels;
+using Grpc.Core;
 using WpfMultiProcess.Host.Session;
+using WpfMultiProcess.Ipc.Common;
 using WpfMultiProcess.Ipc.Table;
 
 namespace WpfMultiProcess.Demo.Host.Features.Table;
 
-/// <summary>table 会话的宿主侧状态:行集合 + 排序状态 + 50ms 一帧的 producer,原来挂在
-/// TableServiceImpl 内部的 per-session Producer,现在下沉成 Session 自己的状态——
+/// <summary>table 会话的宿主侧状态:自建一个 <c>Channel&lt;TableDown&gt;</c> 作为自己的
+/// 数据管道 + 行集合 + 排序状态 + 50ms 一帧的 producer,原来这条管道由框架的
+/// Subscription&lt;TDown&gt; 代持,现在完全下沉成 Session 自己的私有状态——
 /// Sort unary(见 TableServiceImpl.Sort)经 SessionManager.FindSession 直接改这里的
 /// 排序状态,下一帧 ProduceAsync 立即按新排序算 ordered_ids,子进程侧不需要再排一遍。</summary>
-public sealed class TableSession : Session<TableDown>
+public sealed class TableSession : Session
 {
     private sealed class RowState
     {
@@ -19,6 +24,9 @@ public sealed class TableSession : Session<TableDown>
 
     private static readonly string[] StatusPool = ["ok", "warn", "error", "idle"];
 
+    private readonly Channel<TableDown> _channel = Channel.CreateBounded<TableDown>(
+        new BoundedChannelOptions(256) { FullMode = BoundedChannelFullMode.DropOldest });
+
     private readonly Lock _lock = new();
     private readonly Dictionary<long, RowState> _rows = new();
     private string _sortField = "id";
@@ -29,11 +37,26 @@ public sealed class TableSession : Session<TableDown>
     private CancellationTokenSource? _produceCts;
     private Task? _produceTask;
 
-    public TableSession(string sessionId, string featureId, int featureIndex)
-        : base(sessionId, featureId, featureIndex,
-            ping => new TableDown { Ping = ping },
-            shutdown => new TableDown { Shutdown = shutdown })
+    public TableSession(string sessionId, string featureId) : base(sessionId, featureId)
     {
+    }
+
+    public override void SendHeartbeat(Ping ping) =>
+        _channel.Writer.TryWrite(new TableDown { Ping = ping });
+
+    public override void SendClose(Shutdown shutdown) =>
+        _channel.Writer.TryWrite(new TableDown { Shutdown = shutdown });
+
+    public override async Task ServeAsync<T>(IServerStreamWriter<T> writer, CancellationToken ct)
+    {
+        if (writer is not IServerStreamWriter<TableDown> typed)
+            throw new InvalidOperationException(
+                $"TableSession.ServeAsync 只支持 IServerStreamWriter<TableDown>,实际传入 {typeof(T)}");
+        try
+        {
+            await SessionPump.PumpAsync(_channel.Reader, typed, ct);
+        }
+        catch (IOException) { }
     }
 
     // 跨程序集 override "protected internal" 成员时,C# 只允许声明为 "protected"
@@ -50,6 +73,12 @@ public sealed class TableSession : Session<TableDown>
     }
 
     protected override void OnDisconnected() => _produceCts?.Cancel();
+
+    public override void Dispose()
+    {
+        _produceCts?.Cancel();
+        _channel.Writer.TryComplete();
+    }
 
     private void AddRow(Random rand)
     {
@@ -106,7 +135,7 @@ public sealed class TableSession : Session<TableDown>
 
                     env = new TableDown { Delta = delta };
                 }
-                PushData(env);
+                _channel.Writer.TryWrite(env);
             }
         }
         catch (OperationCanceledException) { }

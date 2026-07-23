@@ -1,4 +1,3 @@
-using System.IO;
 using Grpc.Core;
 using WpfMultiProcess.Host.Session;
 using WpfMultiProcess.Ipc.Waveform;
@@ -7,9 +6,10 @@ namespace WpfMultiProcess.Demo.Host.Features.Waveform;
 
 /// <summary>
 /// waveform feature 专属 gRPC service:会话建立(StreamRequest 带 session_id/hwnd/pid,
-/// 经 SessionManager.TryOpen&lt;WaveformDown&gt; 校验并接上 Subscription)后先下发一条
-/// Reply,再把 Subscription 里的帧(数据帧由 WaveformSession 自己的 producer 推,心跳/关闭
-/// 由 SessionManager 推)原样转发进 gRPC stream;专属 unary GetStatistics 经
+/// 经 SessionManager.TryOpen 校验、取回 OpenFeature 时就建好的 WaveformSession)后先下发
+/// 一条 Reply,再把 gRPC 的 <see cref="IServerStreamWriter{T}"/> 的所有权整个交给
+/// WaveformSession.ServeAsync(数据帧由它自己的 producer 推,心跳/关闭也由它自己的
+/// SendHeartbeat/SendClose 写进同一条管道);专属 unary GetStatistics 经
 /// SessionManager.FindSession 直接读 WaveformSession 的统计快照。
 /// </summary>
 public sealed class WaveformServiceImpl(SessionManager sessionManager) : WaveformService.WaveformServiceBase
@@ -17,10 +17,10 @@ public sealed class WaveformServiceImpl(SessionManager sessionManager) : Wavefor
     public override async Task Register(StreamRequest request,
         IServerStreamWriter<WaveformDown> down, ServerCallContext context)
     {
-        // 未知的 session_id(没被 SessionManager.OpenFeature 建立过)或 feature 对不上、
+        // 未知的 session_id(没被 SessionManager.OpenFeature 建立过)或 feature 对不上,
         // 或该会话不是 WaveformSession,一律拒绝——直接结束这次 RPC,不写 Reply。
-        if (!sessionManager.TryOpen<WaveformDown>(request.SessionId, "waveform", request.Pid, (nint)request.Hwnd,
-                out var sub) || sub is null)
+        if (!sessionManager.TryOpen(request.SessionId, "waveform", request.Pid, (nint)request.Hwnd, out var session)
+            || session is not WaveformSession waveformSession)
             return;
 
         await down.WriteAsync(new WaveformDown { Reply = sessionManager.ReplyOf("waveform") },
@@ -28,14 +28,11 @@ public sealed class WaveformServiceImpl(SessionManager sessionManager) : Wavefor
 
         try
         {
-            await foreach (var env in sub.Reader.ReadAllAsync(context.CancellationToken))
-                await down.WriteAsync(env, context.CancellationToken);
+            await waveformSession.ServeAsync(down, context.CancellationToken);
         }
-        catch (OperationCanceledException) { }
-        catch (IOException) { }
         finally
         {
-            sessionManager.DetachStream(sub);
+            sessionManager.DetachStream(waveformSession);
         }
     }
 

@@ -1,26 +1,49 @@
+using System.IO;
+using System.Threading.Channels;
+using Grpc.Core;
 using WpfMultiProcess.Host.Session;
+using WpfMultiProcess.Ipc.Common;
 using WpfMultiProcess.Ipc.Waveform;
 
 namespace WpfMultiProcess.Demo.Host.Features.Waveform;
 
-/// <summary>waveform 会话的宿主侧状态:50ms 一帧正弦波 producer + min/max/avg/count 统计,
-/// 原来挂在 WaveformServiceImpl 内部的 per-session Producer 字典,现在下沉成 Session 自己
-/// 的状态——OnConnected(子进程 hwnd 落地、Subscription 已接上)时起 producer,
-/// OnDisconnected 时停,GetStatistics unary 经 SessionManager.FindSession 直接读
-/// Snapshot(),不需要额外的会话查找表。</summary>
-public sealed class WaveformSession : Session<WaveformDown>
+/// <summary>waveform 会话的宿主侧状态:自建一个 <c>Channel&lt;WaveformDown&gt;</c> 作为
+/// 自己的数据管道(心跳/关闭/数据帧都经它统一推给 gRPC stream),外加 50ms 一帧正弦波
+/// producer + min/max/avg/count 统计。原来这条管道由框架的 Subscription&lt;TDown&gt;
+/// 代持,现在完全下沉成 Session 自己的私有状态——SendHeartbeat/SendClose 直接把
+/// Ping/Shutdown 包成 WaveformDown 写进自己的 channel,ServeAsync 把 channel 的
+/// reader 和 gRPC 的 writer 一起交给 <see cref="SessionPump.PumpAsync{T}"/>。</summary>
+public sealed class WaveformSession : Session
 {
+    private readonly Channel<WaveformDown> _channel = Channel.CreateBounded<WaveformDown>(
+        new BoundedChannelOptions(256) { FullMode = BoundedChannelFullMode.DropOldest });
+
     private readonly Lock _statsLock = new();
     private CancellationTokenSource? _produceCts;
     private Task? _produceTask;
     private long _count;
     private double _min = double.MaxValue, _max = double.MinValue, _sum;
 
-    public WaveformSession(string sessionId, string featureId, int featureIndex)
-        : base(sessionId, featureId, featureIndex,
-            ping => new WaveformDown { Ping = ping },
-            shutdown => new WaveformDown { Shutdown = shutdown })
+    public WaveformSession(string sessionId, string featureId) : base(sessionId, featureId)
     {
+    }
+
+    public override void SendHeartbeat(Ping ping) =>
+        _channel.Writer.TryWrite(new WaveformDown { Ping = ping });
+
+    public override void SendClose(Shutdown shutdown) =>
+        _channel.Writer.TryWrite(new WaveformDown { Shutdown = shutdown });
+
+    public override async Task ServeAsync<T>(IServerStreamWriter<T> writer, CancellationToken ct)
+    {
+        if (writer is not IServerStreamWriter<WaveformDown> typed)
+            throw new InvalidOperationException(
+                $"WaveformSession.ServeAsync 只支持 IServerStreamWriter<WaveformDown>,实际传入 {typeof(T)}");
+        try
+        {
+            await SessionPump.PumpAsync(_channel.Reader, typed, ct);
+        }
+        catch (IOException) { }
     }
 
     // 跨程序集 override "protected internal" 成员时,C# 只允许声明为 "protected"
@@ -33,6 +56,12 @@ public sealed class WaveformSession : Session<WaveformDown>
 
     protected override void OnDisconnected() => _produceCts?.Cancel();
 
+    public override void Dispose()
+    {
+        _produceCts?.Cancel();
+        _channel.Writer.TryComplete();
+    }
+
     private async Task ProduceAsync(CancellationToken ct)
     {
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(50));
@@ -44,7 +73,7 @@ public sealed class WaveformSession : Session<WaveformDown>
                 seq++;
                 double value = Math.Sin(seq * 0.12) * (0.6 + 0.4 * Math.Sin(seq * 0.011));
                 RecordSample(value);
-                PushData(new WaveformDown
+                _channel.Writer.TryWrite(new WaveformDown
                 {
                     Frame = new WaveformFrame
                     {

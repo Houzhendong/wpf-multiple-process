@@ -24,7 +24,7 @@ public sealed class WaveformFeature : IFeatureHost
     };
 
     public Session CreateSession(FeatureInstanceContext ctx) =>
-        new WaveformSession(ctx.SessionId, FeatureId, ctx.FeatureIndex);
+        new WaveformSession(ctx.SessionId, FeatureId);
 
     public void MapService(IEndpointRouteBuilder endpoints) => endpoints.MapGrpcService<WaveformServiceImpl>();
 }

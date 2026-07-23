@@ -23,7 +23,7 @@ public sealed class TableFeature : IFeatureHost
     };
 
     public Session CreateSession(FeatureInstanceContext ctx) =>
-        new TableSession(ctx.SessionId, FeatureId, ctx.FeatureIndex);
+        new TableSession(ctx.SessionId, FeatureId);
 
     public void MapService(IEndpointRouteBuilder endpoints) => endpoints.MapGrpcService<TableServiceImpl>();
 }

@@ -17,11 +17,12 @@ public sealed record SessionLaunchOptions(string ExecutablePath, string SocketPa
 /// 多开出独立的会话/独立的子进程。
 ///
 /// 心跳/Pong 超时检测/UI 饱和度路由这几个和具体 feature 完全无关的职责原样保留;
-/// 会话建立的校验(TryOpen)现在还多做一件事:把 Session&lt;TDown&gt; 和它的
-/// Subscription&lt;TDown&gt; 接上,并调用 Session 上的生命周期虚方法(OnConnected/
-/// OnPong/OnUiStats/OnDisconnected),取代原来"SessionHub 只认 feature-无关状态"的
-/// 设计——具体 feature 的会话状态(producer 是否在跑、统计值……)现在下沉到调库方
-/// 自己的 Session 子类里,SessionManager 本身仍然不知道 TDown 是什么类型。
+/// 会话建立的校验(TryOpen)现在不再代持数据管道——Session 本身就是非泛型的
+/// <see cref="Session"/>,数据管道(Channel、怎么把 Ping/Shutdown 包成自己的
+/// envelope)完全下沉到调库方的 Session 子类里,SessionManager 只管理"这个会话是否
+/// 已连接"这一件事(<c>_connected</c> 表),并在恰当的时机调用 Session 上的生命周期
+/// 虚方法(OnConnected/OnPong/OnUiStats/OnDisconnected)——这一点和 M1 之前一致,
+/// 变化的只是"谁持有把数据推上去的那根管子"。
 /// </summary>
 public sealed class SessionManager : IDisposable
 {
@@ -39,7 +40,7 @@ public sealed class SessionManager : IDisposable
     private readonly IReadOnlyList<IFeatureHost> _features;
 
     private readonly ConcurrentDictionary<string, SessionEntry> _entries = new();     // sessionId -> entry
-    private readonly ConcurrentDictionary<string, Subscription> _subs = new();        // sessionId -> 订阅(心跳循环只认这个基类)
+    private readonly ConcurrentDictionary<string, Session> _connected = new();        // sessionId -> 已连接的会话(心跳循环只认这个非泛型基类)
     private readonly ConcurrentDictionary<string, long> _lastPongMs = new();
     private readonly ConcurrentDictionary<string, int> _nextFeatureIndex = new();     // featureId -> 下一个可用 index
     private readonly HashSet<string> _unresponsive = [];
@@ -88,6 +89,7 @@ public sealed class SessionManager : IDisposable
         string sessionId = Guid.NewGuid().ToString();
 
         var session = feature.CreateSession(new FeatureInstanceContext(sessionId, index));
+        session.FeatureIndex = index; // Session 构造时还不知道自己的 index,这里回填
         var overlay = new OverlayHost();
         var pane = _dock.AddPane(sessionId, $"{feature.Descriptor.Title} #{index}", overlay);
 
@@ -101,7 +103,7 @@ public sealed class SessionManager : IDisposable
         };
         _entries[sessionId] = entry;
 
-        pane.Closed += (_, _) => CloseSession(sessionId);
+        pane.Closed += (_, _) => CloseSession(sessionId, ShutdownReason.PaneClosed);
 
         entry.Process.EnableRaisingEvents = true;
         entry.Process.Exited += (_, _) =>
@@ -132,15 +134,18 @@ public sealed class SessionManager : IDisposable
         return Process.Start(psi)!;
     }
 
-    /// <summary>关闭一个会话:推 Shutdown、关 pane、把 OverlayHost 打回空白占位、
-    /// 从会话表里移除,并在子进程 1.5s 内未自行退出时 Kill 兜底。可以从三个方向
-    /// 触发(用户关 pane / 子进程自己退出 / CloseAll 时批量调用),用 TryRemove 做
-    /// 幂等门,保证只真正执行一次。</summary>
-    public void CloseSession(string sessionId)
+    /// <summary>关闭一个会话:推 Shutdown(带上触发源 reason)、关 pane、把 OverlayHost
+    /// 打回空白占位、从会话表里移除,并在子进程 1.5s 内未自行退出时 Kill 兜底。可以从
+    /// 三个方向触发(用户关 pane / 子进程自己退出 / CloseAll 时批量调用),用 TryRemove
+    /// 做幂等门,保证只真正执行一次。默认 reason 是 CLOSED_BY_API,对应"调库方代码
+    /// 主动调用",各触发源自己传更精确的 reason(见 OpenFeature 里的 pane.Closed/
+    /// CloseAll)。</summary>
+    public void CloseSession(string sessionId,
+        ShutdownReason reason = ShutdownReason.ClosedByApi, string detail = "")
     {
         if (!_entries.TryRemove(sessionId, out var entry)) return;
 
-        entry.Session.SendClose();
+        entry.Session.SendClose(new Shutdown { Reason = reason, Detail = detail });
         // CloseSession 的调用方里,pane.Closed(用户点关闭)和 CloseAll(主窗口关闭)
         // 都在 UI 线程,但 Process.Exited(子进程自己退出/被杀)来自线程池——Pane.Close()
         // /Overlay.DetachChild() 都会碰 UI 线程独占的 WPF 对象(AvalonDock LayoutDocument/
@@ -166,38 +171,32 @@ public sealed class SessionManager : IDisposable
         catch { /* 已退出 */ }
     }
 
-    /// <summary>主窗口关闭时调用:依次关闭全部会话(SendClose + kill 兜底),
+    /// <summary>主窗口关闭时调用:依次关闭全部会话(SendClose{HOST_CLOSING} + kill 兜底),
     /// 复用 CloseSession 的全部逻辑。</summary>
     public void CloseAll()
     {
         foreach (var sessionId in _entries.Keys.ToList())
-            CloseSession(sessionId);
+            CloseSession(sessionId, ShutdownReason.HostClosing);
     }
 
     /// <summary>feature service 的 Register 收到开流请求(带 session_id/hwnd/pid)时调用:
-    /// 校验 session_id 是 OpenFeature 建立过的、feature 匹配、且该 Session 确实是
-    /// Session&lt;TDown&gt;,通过则造 Subscription&lt;TDown&gt;(由 Session 自己的
-    /// wrapControl 现造,见 Session&lt;TDown&gt;.CreateSubscription)、接上心跳表、
-    /// 触发 SessionConnected/WindowRegistered、OverlayHost.AttachChild、
-    /// Session.OnConnected。未知的 session_id / feature 不对 / 类型不对一律拒绝,
-    /// 调用方应直接结束这次 RPC,不写 Reply、不建订阅。</summary>
-    public bool TryOpen<TDown>(string sessionId, string featureId, int pid, nint hwnd,
-        out Subscription<TDown>? subscription)
+    /// 校验 session_id 是 OpenFeature 建立过的、feature 匹配,通过则把 pid/hwnd 回填进
+    /// Session、接上心跳表(_connected)、触发 SessionConnected/WindowRegistered、
+    /// OverlayHost.AttachChild、Session.OnConnected,并把这个 Session 实例经
+    /// <paramref name="session"/> 传出去供调用方(feature service impl)接着调用
+    /// <see cref="Session.ServeAsync{T}"/>。未知的 session_id / feature 不对一律拒绝,
+    /// 调用方应直接结束这次 RPC,不写 Reply。</summary>
+    public bool TryOpen(string sessionId, string featureId, int pid, nint hwnd, out Session? session)
     {
-        subscription = null;
+        session = null;
         if (!_entries.TryGetValue(sessionId, out var entry) || entry.FeatureId != featureId)
             return false;
-        if (entry.Session is not Session<TDown> typedSession)
-            return false;
 
-        entry.Session.Pid = pid;
-        entry.Session.Hwnd = hwnd;
+        session = entry.Session;
+        session.Pid = pid;
+        session.Hwnd = hwnd;
         _lastPongMs[sessionId] = NowMs();
-
-        var sub = typedSession.CreateSubscription();
-        typedSession.AttachSubscription(sub);
-        _subs[sessionId] = sub;
-        subscription = sub;
+        _connected[sessionId] = session;
 
         SessionConnected?.Invoke(sessionId, featureId, pid);
         WindowRegistered?.Invoke(sessionId, featureId, hwnd);
@@ -207,35 +206,37 @@ public sealed class SessionManager : IDisposable
         // 用 Dispatcher.BeginInvoke 调 AttachChild 的方式一致。OnConnected 不碰任何 UI
         // 对象(典型实现只起一个后台 producer),线程无关,原样同步调用即可。
         entry.Overlay.Dispatcher.BeginInvoke(() => entry.Overlay.AttachChild(hwnd));
-        typedSession.OnConnected(hwnd);
+        session.OnConnected(hwnd);
         return true;
     }
 
     /// <summary>feature service 的 Register 的 stream 结束(finally 块)时调用,
-    /// 对称于 TryOpen&lt;TDown&gt;:把 Session 和这条 Subscription 解绑、从心跳表里
-    /// 摘除、回到空白占位、触发 SessionDisconnected + Session.OnDisconnected。
+    /// 对称于 TryOpen:把会话从"已连接"表里摘除、从心跳表里摘除、回到空白占位、
+    /// 触发 SessionDisconnected + Session.OnDisconnected,并保证
+    /// <see cref="Session.Dispose"/> 恰好被调用一次(经 <see cref="Session.DisposeOnce"/>
+    /// 幂等门——同一个会话可能同时经用户主动 CloseSession 和这里两条路径触发清理)。
     /// 注意这不等于 CloseSession——子进程可能只是暂时断线,pane 仍然留着等重连
     /// (本框架里子进程和会话是 1:1、断线基本等于结束,但语义上和"用户主动关 pane"
     /// 分开,方便调库方将来做重连策略)。</summary>
-    public void DetachStream<TDown>(Subscription<TDown> sub)
+    public void DetachStream(Session session)
     {
-        if (!_subs.TryGetValue(sub.SessionId, out var cur) || !ReferenceEquals(cur, sub))
-            return; // 已经被更新的订阅替换,不是"自己"的注册,防止误删
+        if (!_connected.TryGetValue(session.SessionId, out var cur) || !ReferenceEquals(cur, session))
+            return; // 已经被更新的会话替换,不是"自己"的注册,防止误删
 
-        _subs.TryRemove(sub.SessionId, out _);
-        _lastPongMs.TryRemove(sub.SessionId, out _);
-        lock (_unresponsiveLock) _unresponsive.Remove(sub.SessionId);
+        _connected.TryRemove(session.SessionId, out _);
+        _lastPongMs.TryRemove(session.SessionId, out _);
+        lock (_unresponsiveLock) _unresponsive.Remove(session.SessionId);
 
-        if (_entries.TryGetValue(sub.SessionId, out var entry))
+        if (_entries.TryGetValue(session.SessionId, out var entry))
         {
-            if (entry.Session is Session<TDown> typedSession)
-                typedSession.DetachSubscription(sub);
             // 同 TryOpen:DetachStream 也来自 gRPC 线程池,DetachChild 摸的是 UI 线程的
             // OverlayHost,必须调度回它的 Dispatcher;OnDisconnected 线程无关,同步调用。
             entry.Overlay.Dispatcher.BeginInvoke(() => entry.Overlay.DetachChild());
-            entry.Session.OnDisconnected();
-            SessionDisconnected?.Invoke(sub.SessionId, sub.FeatureId);
+            session.OnDisconnected();
+            SessionDisconnected?.Invoke(session.SessionId, session.FeatureId);
         }
+
+        session.DisposeOnce();
     }
 
     /// <summary>Register 时回给子进程的展示元数据,从注册的 IFeatureHost 列表里查该
@@ -283,8 +284,8 @@ public sealed class SessionManager : IDisposable
 
     public void LogEvent(string tag, string message) => FeatureLog?.Invoke(tag, message);
 
-    /// <summary>心跳:每 2 秒向所有会话推送带时间戳的 Ping(经 Session.SendHeartbeat →
-    /// WriteControl → 各自 Session&lt;TDown&gt; 的 wrapControl 接缝包成自己的 envelope)。</summary>
+    /// <summary>心跳:每 2 秒向所有已连接会话推送带时间戳的 Ping(经
+    /// Session.SendHeartbeat,各自实现把它包成自己的 envelope 写进自己的管道)。</summary>
     private async Task HeartbeatLoopAsync(CancellationToken ct)
     {
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
@@ -294,9 +295,8 @@ public sealed class SessionManager : IDisposable
             {
                 long seq = ++_pingSeq;
                 var ping = new Ping { Seq = seq, TimestampMs = NowMs() };
-                foreach (var sub in _subs.Values)
-                    if (_entries.TryGetValue(sub.SessionId, out var entry))
-                        entry.Session.SendHeartbeat(ping);
+                foreach (var session in _connected.Values)
+                    session.SendHeartbeat(ping);
 
                 CheckUnresponsive();
             }
@@ -311,25 +311,25 @@ public sealed class SessionManager : IDisposable
     private void CheckUnresponsive()
     {
         long now = NowMs();
-        foreach (var sub in _subs.Values)
+        foreach (var session in _connected.Values)
         {
-            if (!_lastPongMs.TryGetValue(sub.SessionId, out var last)) continue;
-            if (!_entries.TryGetValue(sub.SessionId, out var entry)) continue;
+            if (!_lastPongMs.TryGetValue(session.SessionId, out var last)) continue;
+            if (!_entries.TryGetValue(session.SessionId, out var entry)) continue;
             double elapsed = now - last;
             bool isUnresponsiveNow = elapsed > UnresponsiveThresholdMs;
 
             lock (_unresponsiveLock)
             {
-                bool wasUnresponsive = _unresponsive.Contains(sub.SessionId);
+                bool wasUnresponsive = _unresponsive.Contains(session.SessionId);
                 if (isUnresponsiveNow && !wasUnresponsive)
                 {
-                    _unresponsive.Add(sub.SessionId);
-                    UiUnresponsive?.Invoke(sub.SessionId, entry.FeatureId, elapsed);
+                    _unresponsive.Add(session.SessionId);
+                    UiUnresponsive?.Invoke(session.SessionId, entry.FeatureId, elapsed);
                 }
                 else if (!isUnresponsiveNow && wasUnresponsive)
                 {
-                    _unresponsive.Remove(sub.SessionId);
-                    UiRecovered?.Invoke(sub.SessionId, entry.FeatureId);
+                    _unresponsive.Remove(session.SessionId);
+                    UiRecovered?.Invoke(session.SessionId, entry.FeatureId);
                 }
             }
         }

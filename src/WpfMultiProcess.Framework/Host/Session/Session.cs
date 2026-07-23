@@ -1,25 +1,36 @@
+using Grpc.Core;
 using WpfMultiProcess.Ipc.Common;
 
 namespace WpfMultiProcess.Host.Session;
 
 /// <summary>
-/// 一个子进程实例的抽象(非泛型基类,调库方不直接继承这个,而是继承下面的
-/// <see cref="Session{TDown}"/>)。持有会话身份(session_id/featureId/featureIndex)
-/// 和已知的 pid/hwnd,并把"给这个会话发心跳/关闭"统一成 <see cref="SendHeartbeat"/>/
-/// <see cref="SendClose"/> 两个不感知具体 envelope 类型的方法——真正的写入由
-/// <see cref="Session{TDown}"/> 经 <c>Subscription&lt;TDown&gt;</c> 实现。
+/// 一个子进程实例的抽象——框架"只操作 session":调库方继承这个类,自己决定数据管道
+/// 怎么实现(典型做法是内部自建一个 <c>Channel&lt;TDown&gt;</c> + 一个把这个 channel
+/// 泵进 gRPC stream 的循环,见 <see cref="SessionPump"/>),框架本身完全不知道 TDown
+/// 是什么类型,只调用这里声明的这几个方法/钩子。
 ///
-/// M1 阶段:proto 侧的 Control{ping/shutdown} 包装已经去掉,Ping/Shutdown 直接是
-/// XxxDown 的 oneof 分支,这里的接缝相应拆成 <see cref="WritePing"/>/
-/// <see cref="WriteShutdown"/> 两个。完整的"非泛型 Session + IDisposable + 会话建立
-/// 反转"是后续里程碑的事,这一步只保证 proto 改动后能编译、语义不变。
-///
-/// 生命周期虚方法(<see cref="OnConnected"/>/<see cref="OnPong"/>/<see cref="OnUiStats"/>/
-/// <see cref="OnDisconnected"/>)供调库方在自己的 Session 子类里 override,承接原来散落在
-/// SessionHub/各 ServiceImpl 里的"会话连上了/收到 Pong 了/该起 producer 了"这类时机。
+/// 不再有泛型的 <c>Session&lt;TDown&gt;</c>/<c>Subscription&lt;TDown&gt;</c>——那一套是
+/// "框架代持数据管道"的设计,现在数据管道(Channel/队列 + 怎么把 Ping/Shutdown 包装成
+/// 自己的 envelope)完全下沉给实现方,框架的契约收缩成:
+///   - <see cref="SendHeartbeat"/>/<see cref="SendClose"/>:框架心跳循环/CloseSession
+///     调用,实现方把 Ping/Shutdown 包成自己的 envelope 写进自己的管道;
+///   - <see cref="ServeAsync{T}"/>:接收 <see cref="IServerStreamWriter{T}"/> 的所有权——
+///     feature service 的 Register 处理器(实现方代码)在
+///     <c>SessionManager.Register(session,...)</c> 成功、写完 Reply 后 await 它,直到
+///     会话结束才返回。调用方(实现方自己的 service impl)传进来的 T 恒等于该实现方自己
+///     的 TDown,实现里 override 时把 <paramref name="writer"/> cast 回具体类型即可
+///     (framework 不做也不能做这个类型校验,cast 失败说明调用方自己传错了类型)。
+///   - 生命周期钩子(<see cref="OnConnected"/>/<see cref="OnPong"/>/<see cref="OnUiStats"/>/
+///     <see cref="OnDisconnected"/>)保留,时机不变。
+///   - <see cref="IDisposable.Dispose"/>:实现方在这里退订/清理自己的数据管道;框架保证
+///     会话结束(Unregister)时恰好调用一次——见 <see cref="DisposeOnce"/>,这是个幂等门,
+///     同一个 Session 可能同时经 CloseSession 和 stream 的 finally 两条路径触发清理,
+///     幂等门确保只有第一次真正调用到 <see cref="Dispose"/>。
 /// </summary>
-public abstract class Session
+public abstract class Session : IDisposable
 {
+    private int _disposed;
+
     /// <summary>MainWindow/SessionManager 在拉起子进程之前生成的会话标识,作为 --session
     /// 启动参数传给子进程。</summary>
     public string SessionId { get; }
@@ -27,35 +38,35 @@ public abstract class Session
     public string FeatureId { get; }
 
     /// <summary>同一 feature 下第几次 OpenFeature 打开的实例(0 起),支持同一 feature
-    /// 多开。</summary>
-    public int FeatureIndex { get; }
+    /// 多开。由 SessionManager 在 Register 时从预登记表回填,构造时还不知道。</summary>
+    public int FeatureIndex { get; internal set; }
 
-    /// <summary>子进程开流请求带上来的 pid/hwnd,TryOpen 校验通过后回填。</summary>
+    /// <summary>子进程开流请求带上来的 pid/hwnd,Register 校验通过后回填。</summary>
     public int Pid { get; internal set; }
     public nint Hwnd { get; internal set; }
 
-    protected Session(string sessionId, string featureId, int featureIndex)
+    protected Session(string sessionId, string featureId)
     {
         SessionId = sessionId;
         FeatureId = featureId;
-        FeatureIndex = featureIndex;
     }
 
-    /// <summary>把心跳 Ping 包装成本会话 feature 自己的 envelope 类型再写入 stream——
-    /// 具体包装/写入由 <see cref="Session{TDown}"/> 经 Subscription&lt;TDown&gt; 完成,
-    /// 这里只声明接缝,仅框架内部(SessionManager 的心跳循环)调用。</summary>
-    internal abstract void WritePing(Ping ping);
+    /// <summary>心跳:SessionManager 心跳循环里对每个已连接的会话调用,实现方把 Ping
+    /// 包成自己的 envelope 写进自己的管道(管道满了要不要丢包、丢哪个,由实现方决定,
+    /// 框架不做假设)。</summary>
+    public abstract void SendHeartbeat(Ping ping);
 
-    /// <summary>同上,包装 Shutdown。</summary>
-    internal abstract void WriteShutdown(Shutdown shutdown);
+    /// <summary>关闭:CloseSession / 主窗口关闭时调用,reason 由框架按触发源填好
+    /// (见 SessionManager.CloseSession/CloseAll)。</summary>
+    public abstract void SendClose(Shutdown shutdown);
 
-    /// <summary>心跳:SessionManager 心跳循环里对每个会话调用。</summary>
-    public void SendHeartbeat(Ping ping) => WritePing(ping);
+    /// <summary>接收 <see cref="IServerStreamWriter{T}"/> 的所有权:feature service 的
+    /// Register 处理器写完第一条 Reply 之后调用这个方法并 await 它,直到会话结束(流断开/
+    /// 取消/正常关闭)才返回。典型实现是把自己内部 Channel 的 Reader 和这个 writer 一起
+    /// 交给 <see cref="SessionPump.PumpAsync{T}"/>。</summary>
+    public abstract Task ServeAsync<T>(IServerStreamWriter<T> writer, CancellationToken ct);
 
-    /// <summary>关闭:CloseSession / 主窗口关闭时对每个会话调用。</summary>
-    public void SendClose() => WriteShutdown(new Shutdown());
-
-    /// <summary>子进程开流请求 TryOpen 校验通过、hwnd 落地时调用(SessionManager 内部)。
+    /// <summary>SessionManager.Register 校验通过、hwnd 落地时调用(SessionManager 内部)。
     /// 典型用途:调库方在这里启动自己的数据 producer。</summary>
     protected internal virtual void OnConnected(nint hwnd) { }
 
@@ -66,56 +77,22 @@ public abstract class Session
     /// <summary>收到这个会话的 UiSaturationMeter 上报时调用。</summary>
     protected internal virtual void OnUiStats(UiStatsRequest stats) { }
 
-    /// <summary>会话断开(子进程退出/stream 断开)时调用。典型用途:停掉自己的 producer。</summary>
+    /// <summary>会话断开(子进程退出/stream 断开)时调用。典型用途:停掉自己的 producer。
+    /// 注意这个钩子和 <see cref="Dispose"/> 不是一回事:OnDisconnected 只在"曾经连接过"
+    /// 时触发,Dispose 无论有没有连接成功都保证恰好一次。</summary>
     protected internal virtual void OnDisconnected() { }
-}
 
-/// <summary>
-/// 持有具体 feature envelope 类型(TDown,即 XxxDown oneof 消息)的 Session 基类——
-/// 调库方的 host 侧 Session 实现(如 demo 的 WaveformSession)继承这个类,既能
-/// <see cref="PushData"/> 推自己的业务数据帧,也自动获得心跳/关闭包装。
-///
-/// 持有一个 <see cref="Subscription{TDown}"/> 引用(子进程开流、TryOpen 校验通过后由
-/// SessionManager 绑定上来,见 <see cref="AttachSubscription"/>)和两个 wrap 委托——
-/// 这正是主进程侧"把 Ping/Shutdown 包成 TDown"的接缝,SessionManager 本身完全不感知
-/// TDown 是什么类型。
-/// </summary>
-public abstract class Session<TDown> : Session
-{
-    private readonly Func<Ping, TDown> _wrapPing;
-    private readonly Func<Shutdown, TDown> _wrapShutdown;
-    private Subscription<TDown>? _subscription;
+    /// <summary>实现方在这里退订/清理自己的数据管道(典型做法:Complete 自己的 Channel
+    /// writer、取消自己的 producer CancellationTokenSource)。框架通过
+    /// <see cref="DisposeOnce"/> 保证这个方法只会被真正调用一次。</summary>
+    public virtual void Dispose() { }
 
-    protected Session(string sessionId, string featureId, int featureIndex,
-        Func<Ping, TDown> wrapPing, Func<Shutdown, TDown> wrapShutdown)
-        : base(sessionId, featureId, featureIndex)
+    /// <summary>框架内部(SessionManager.Unregister/CloseSession)调用的幂等门:同一个
+    /// 会话结束时可能有两条路径都想清理它(用户主动 CloseSession、feature service 的
+    /// Register 流自然结束),这里保证 <see cref="Dispose"/> 只被调用一次。</summary>
+    internal void DisposeOnce()
     {
-        _wrapPing = wrapPing;
-        _wrapShutdown = wrapShutdown;
+        if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            Dispose();
     }
-
-    /// <summary>SessionManager.TryOpen&lt;TDown&gt; 里调用:本 Session 是自己 wrap 委托的
-    /// 唯一持有者,由它现造一个新的 Subscription&lt;TDown&gt;,SessionManager 自己完全不需要
-    /// 知道 TDown 的 wrap 规则是什么。</summary>
-    internal Subscription<TDown> CreateSubscription() => new(SessionId, FeatureId);
-
-    /// <summary>SessionManager.TryOpen 里,子进程开流请求校验通过后调用,把这个会话
-    /// 接下来的推流通道接上。</summary>
-    internal void AttachSubscription(Subscription<TDown> subscription) => _subscription = subscription;
-
-    /// <summary>会话断开时(feature service 的 Register finally 块)由 SessionManager 调用,
-    /// 避免断线重连场景下 PushData 写进一个已经没有读者的旧 Subscription。</summary>
-    internal void DetachSubscription(Subscription<TDown> subscription)
-    {
-        if (ReferenceEquals(_subscription, subscription))
-            _subscription = null;
-    }
-
-    internal override void WritePing(Ping ping) => _subscription?.WriteData(_wrapPing(ping));
-
-    internal override void WriteShutdown(Shutdown shutdown) => _subscription?.WriteData(_wrapShutdown(shutdown));
-
-    /// <summary>调库方在自己的 producer 里调用,推一帧业务数据。会话还没建立(子进程未连接)
-    /// 或已断开时静默丢弃——同 Subscription 本身"满了丢最旧帧"的降级哲学一致。</summary>
-    protected void PushData(TDown data) => _subscription?.WriteData(data);
 }
