@@ -5,34 +5,39 @@ using WpfMultiProcess.Ipc.Waveform;
 namespace WpfMultiProcess.Demo.Host.Features.Waveform;
 
 /// <summary>
-/// waveform feature 专属 gRPC service:会话建立(StreamRequest 带 session_id/hwnd/pid,
-/// 经 SessionManager.TryOpen 校验、取回 OpenFeature 时就建好的 WaveformSession)后先下发
-/// 一条 Reply,再把 gRPC 的 <see cref="IServerStreamWriter{T}"/> 的所有权整个交给
-/// WaveformSession.ServeAsync(数据帧由它自己的 producer 推,心跳/关闭也由它自己的
-/// SendHeartbeat/SendClose 写进同一条管道);专属 unary GetStatistics 经
+/// waveform feature 专属 gRPC service:会话建立整个反过来了——Register 收到开流请求
+/// (StreamRequest 带 session_id/hwnd/pid)后,自己 new 一个新的 WaveformSession,
+/// 交给 SessionManager.Register 校验(sessionId 是不是 OpenFeature 预登记过的、
+/// featureId 对不对、有没有被重复注册),通过才下发 Reply,再把 gRPC 的
+/// IServerStreamWriter 的所有权整个交给 WaveformSession.ServeAsync(数据帧由它自己
+/// 的 producer 推,心跳/关闭也由它自己的 SendHeartbeat/SendClose 写进同一条管道);
+/// 结束时经 SessionManager.Unregister 对称清理。专属 unary GetStatistics 经
 /// SessionManager.FindSession 直接读 WaveformSession 的统计快照。
 /// </summary>
 public sealed class WaveformServiceImpl(SessionManager sessionManager) : WaveformService.WaveformServiceBase
 {
+    private const string FeatureId = "waveform";
+
     public override async Task Register(StreamRequest request,
         IServerStreamWriter<WaveformDown> down, ServerCallContext context)
     {
-        // 未知的 session_id(没被 SessionManager.OpenFeature 建立过)或 feature 对不上,
-        // 或该会话不是 WaveformSession,一律拒绝——直接结束这次 RPC,不写 Reply。
-        if (!sessionManager.TryOpen(request.SessionId, "waveform", request.Pid, (nint)request.Hwnd, out var session)
-            || session is not WaveformSession waveformSession)
+        var session = new WaveformSession(request.SessionId, FeatureId);
+
+        // 未知的 session_id(没被 SessionManager.OpenFeature 预登记过)、feature 对不上、
+        // 或这个 sessionId 已经被别的会话注册过,一律拒绝——直接结束这次 RPC,不写 Reply。
+        if (!sessionManager.Register(session, request.Pid, (nint)request.Hwnd))
             return;
 
-        await down.WriteAsync(new WaveformDown { Reply = sessionManager.ReplyOf("waveform") },
+        await down.WriteAsync(new WaveformDown { Reply = sessionManager.ReplyOf(FeatureId) },
             context.CancellationToken);
 
         try
         {
-            await waveformSession.ServeAsync(down, context.CancellationToken);
+            await session.ServeAsync(down, context.CancellationToken);
         }
         finally
         {
-            sessionManager.DetachStream(waveformSession);
+            sessionManager.Unregister(session);
         }
     }
 

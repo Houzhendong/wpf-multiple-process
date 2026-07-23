@@ -1,12 +1,12 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Routing;
 using WpfMultiProcess.Host;
-using WpfMultiProcess.Host.Session;
 
 namespace WpfMultiProcess.Demo.Host.Features.Table;
 
-/// <summary>table feature 的主进程侧接缝:声明展示元数据,每次 OpenFeature 现造一个独立的
-/// TableSession,把 TableServiceImpl 挂到共享 UDS 端点上。</summary>
+/// <summary>table feature 的主进程侧接缝:声明展示元数据,把 TableServiceImpl 挂到
+/// 共享 UDS 端点上。TableSession 不在这里创建——由 TableServiceImpl.Register 收到
+/// 开流请求时自己 new 出来,再交给 SessionManager.Register 校验接入。</summary>
 public sealed class TableFeature : IFeatureHost
 {
     public string FeatureId => "table";
@@ -21,9 +21,6 @@ public sealed class TableFeature : IFeatureHost
             ["heartbeat_interval_ms"] = "2000",
         },
     };
-
-    public Session CreateSession(FeatureInstanceContext ctx) =>
-        new TableSession(ctx.SessionId, FeatureId);
 
     public void MapService(IEndpointRouteBuilder endpoints) => endpoints.MapGrpcService<TableServiceImpl>();
 }
