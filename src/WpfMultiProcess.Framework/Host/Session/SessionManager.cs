@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using Microsoft.Extensions.Logging;
 using WpfMultiProcess.Ipc.Common;
 
 namespace WpfMultiProcess.Host.Session;
@@ -44,6 +45,7 @@ public sealed class SessionManager : IDisposable
 
     private readonly SessionLaunchOptions _launch;
     private readonly IReadOnlyList<IFeatureHost> _features;
+    private readonly ILogger<SessionManager> _logger;
 
     private readonly ConcurrentDictionary<string, SessionEntry> _entries = new();     // sessionId -> entry(预登记/已连接都在这)
     private readonly ConcurrentDictionary<string, Session> _connected = new();        // sessionId -> 已连接的会话(心跳循环只认这个非泛型基类)
@@ -72,10 +74,11 @@ public sealed class SessionManager : IDisposable
     public event Action<string, string>? FeatureLog;
     public event Action<string, string, UiStatsRequest>? UiStatsReceived; // sessionId, featureId, stats
 
-    public SessionManager(SessionLaunchOptions launch, IReadOnlyList<IFeatureHost> features)
+    public SessionManager(SessionLaunchOptions launch, IReadOnlyList<IFeatureHost> features, ILogger<SessionManager> logger)
     {
         _launch = launch;
         _features = features;
+        _logger = logger;
         _ = HeartbeatLoopAsync(_cts.Token);
     }
 
@@ -93,8 +96,12 @@ public sealed class SessionManager : IDisposable
             ?? throw new ArgumentException($"未注册的 featureId: {featureId}", nameof(featureId));
 
         if (_entries.Values.Any(e => e.FeatureId == featureId && e.FeatureIndex == featureIndex))
+        {
+            _logger.LogError("OpenFeature rejected: featureId={FeatureId} featureIndex={FeatureIndex} already has an active session",
+                featureId, featureIndex);
             throw new InvalidOperationException(
                 $"featureId={featureId} featureIndex={featureIndex} 已经存在一个活跃会话,不能重复 OpenFeature");
+        }
 
         string sessionId = Guid.NewGuid().ToString();
 
@@ -120,6 +127,8 @@ public sealed class SessionManager : IDisposable
             CloseSession(sessionId);
         };
 
+        _logger.LogInformation("OpenFeature: sessionId={SessionId} featureId={FeatureId} featureIndex={FeatureIndex} pid={Pid}",
+            sessionId, featureId, featureIndex, entry.Process.Id);
         SessionOpened?.Invoke(sessionId, featureId, featureIndex);
         FeatureLog?.Invoke($"{featureId}#{featureIndex}", $"已启动子进程 pid {entry.Process.Id}");
         return overlay;
@@ -154,6 +163,8 @@ public sealed class SessionManager : IDisposable
     {
         if (!_entries.TryRemove(sessionId, out var entry)) return;
 
+        _logger.LogInformation("CloseSession: sessionId={SessionId} featureId={FeatureId} reason={Reason} detail={Detail}",
+            sessionId, entry.FeatureId, reason, detail);
         entry.Session?.SendClose(new Shutdown { Reason = reason, Detail = detail });
         // CloseSession 的调用方里,pane.Closed(用户点关闭)和 CloseAll(主窗口关闭)
         // 都在 UI 线程,但 Process.Exited(子进程自己退出/被杀)来自线程池——Pane.Close()
@@ -201,9 +212,16 @@ public sealed class SessionManager : IDisposable
     public bool Register(Session session, int pid, nint hwnd)
     {
         if (!_entries.TryGetValue(session.SessionId, out var entry) || entry.FeatureId != session.FeatureId)
+        {
+            _logger.LogWarning("Register rejected: sessionId={SessionId} featureId={FeatureId} not pre-registered or featureId mismatch",
+                session.SessionId, session.FeatureId);
             return false;
+        }
         if (entry.Session is not null)
+        {
+            _logger.LogWarning("Register rejected: sessionId={SessionId} already has a registered session", session.SessionId);
             return false; // 这个 sessionId 已经有一个会话注册过了,拒绝重复注册
+        }
 
         session.FeatureIndex = entry.FeatureIndex;
         session.Pid = pid;
@@ -221,6 +239,8 @@ public sealed class SessionManager : IDisposable
         // 对象(典型实现只起一个后台 producer),线程无关,原样同步调用即可。
         entry.Overlay.Dispatcher.BeginInvoke(() => entry.Overlay.AttachChild(hwnd));
         session.OnConnected(hwnd);
+        _logger.LogInformation("Registered: sessionId={SessionId} featureId={FeatureId} pid={Pid} hwnd={Hwnd:X}",
+            session.SessionId, session.FeatureId, pid, hwnd);
         return true;
     }
 
@@ -250,6 +270,7 @@ public sealed class SessionManager : IDisposable
             SessionDisconnected?.Invoke(session.SessionId, session.FeatureId);
         }
 
+        _logger.LogInformation("Unregistered: sessionId={SessionId} featureId={FeatureId}", session.SessionId, session.FeatureId);
         session.DisposeOnce();
     }
 
@@ -338,11 +359,14 @@ public sealed class SessionManager : IDisposable
                 if (isUnresponsiveNow && !wasUnresponsive)
                 {
                     _unresponsive.Add(session.SessionId);
+                    _logger.LogWarning("UI unresponsive: sessionId={SessionId} featureId={FeatureId} elapsedMs={ElapsedMs}",
+                        session.SessionId, entry.FeatureId, elapsed);
                     UiUnresponsive?.Invoke(session.SessionId, entry.FeatureId, elapsed);
                 }
                 else if (!isUnresponsiveNow && wasUnresponsive)
                 {
                     _unresponsive.Remove(session.SessionId);
+                    _logger.LogInformation("UI recovered: sessionId={SessionId} featureId={FeatureId}", session.SessionId, entry.FeatureId);
                     UiRecovered?.Invoke(session.SessionId, entry.FeatureId);
                 }
             }

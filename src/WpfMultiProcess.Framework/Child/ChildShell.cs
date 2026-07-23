@@ -1,4 +1,5 @@
 using Grpc.Net.Client;
+using Microsoft.Extensions.Logging;
 using WpfMultiProcess.Ipc.Common;
 
 namespace WpfMultiProcess.Child;
@@ -14,13 +15,14 @@ namespace WpfMultiProcess.Child;
 /// 遥测)。
 ///
 /// 真正的数据流由 feature 自己的 <see cref="FeatureViewModel{TDown}"/> 开,demux 出来的
-/// Reply/Control 转发回这里对应的方法:<see cref="SendPong"/>(Control.Ping→UI 线程刷新
-/// 心跳文本+回 Pong)、<see cref="RequestClose"/>(Control.Shutdown→关窗口)、
-/// <see cref="ApplyReply"/>(Register 流第一条 Reply→设标题/主题色)。
+/// Reply/Ping/Shutdown(XxxDown oneof 的三个 feature-无关分支)转发回这里对应的方法:
+/// <see cref="SendPong"/>(Ping→UI 线程刷新心跳文本+回 Pong)、<see cref="RequestClose"/>
+/// (Shutdown→关窗口)、<see cref="ApplyReply"/>(Register 流第一条 Reply→设标题/主题色)。
 /// </summary>
 public sealed class ChildShell : IDisposable
 {
     private readonly CommonService.CommonServiceClient _common;
+    private readonly ILoggerFactory _loggerFactory;
     private UiSaturationMeter? _uiSaturation;
 
     public ChildWindow Window { get; }
@@ -29,11 +31,17 @@ public sealed class ChildShell : IDisposable
     public string FeatureId { get; }
     public int FeatureIndex { get; }
 
+    /// <summary>诊断日志(和 SessionManager.FeatureLog 那条"业务事件转发到主窗口 UI"的
+    /// 通道分开)——FeatureViewModel 也复用这个 logger 记 Shutdown 之类的框架级事件,
+    /// 分类名固定是 ChildShell,因为这几件事本质上都是"这个会话的编排层"在做的诊断。</summary>
+    public ILogger Logger { get; }
+
     /// <summary>子窗口自己的 Win32 句柄,随开流请求带给主进程(不再单独有一次
     /// RegisterWindow RPC)。</summary>
     public nint Hwnd => Window.Hwnd;
 
-    public ChildShell(ChildWindow window, GrpcChannel channel, string sessionId, string featureId, int featureIndex)
+    public ChildShell(ChildWindow window, GrpcChannel channel, string sessionId, string featureId,
+        int featureIndex, ILoggerFactory loggerFactory)
     {
         Window = window;
         Channel = channel;
@@ -41,6 +49,8 @@ public sealed class ChildShell : IDisposable
         FeatureId = featureId;
         FeatureIndex = featureIndex;
         _common = new CommonService.CommonServiceClient(channel);
+        _loggerFactory = loggerFactory;
+        Logger = loggerFactory.CreateLogger<ChildShell>();
 
         // 点击子窗口本身不应该抢激活(WS_EX_NOACTIVATE 拦不到的场景兜底见 ChildWindow),
         // 但主进程侧仍希望"我被点了"能把宿主提到前面,所以点击时 fire-and-forget
@@ -54,7 +64,7 @@ public sealed class ChildShell : IDisposable
     /// 停掉。</summary>
     public void StartUiSaturationSampling()
     {
-        _uiSaturation = new UiSaturationMeter(Window.Dispatcher, _common, SessionId);
+        _uiSaturation = new UiSaturationMeter(Window.Dispatcher, _common, SessionId, _loggerFactory.CreateLogger<UiSaturationMeter>());
         _uiSaturation.Start();
     }
 
@@ -69,7 +79,7 @@ public sealed class ChildShell : IDisposable
         catch { /* 主进程不可达时忽略,不影响窗口自身交互 */ }
     }
 
-    /// <summary>feature 视图模型从自己 stream 里 demux 出 Control.Ping 后调用:在 UI 线程
+    /// <summary>feature 视图模型从自己 stream 里 demux 出 Ping 后调用:在 UI 线程
     /// 更新心跳状态条,并回一个 Pong unary——回 Pong 发生在 UI 线程,证明 UI 未卡死。</summary>
     public void SendPong(Ping ping)
     {
@@ -86,7 +96,7 @@ public sealed class ChildShell : IDisposable
         });
     }
 
-    /// <summary>feature 视图模型从自己 stream 里 demux 出 Control.Shutdown 后调用。</summary>
+    /// <summary>feature 视图模型从自己 stream 里 demux 出 Shutdown 后调用。</summary>
     public void RequestClose() => Window.Dispatcher.BeginInvoke(Window.Close);
 
     /// <summary>feature 视图模型收到 Register 流第一条 Reply 后调用,设标题/主题色。</summary>

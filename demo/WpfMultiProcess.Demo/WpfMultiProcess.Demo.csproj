@@ -21,6 +21,12 @@
     <PackageReference Include="Grpc.Net.Client" Version="2.71.0" />
     <PackageReference Include="Dirkster.AvalonDock" Version="4.72.1" />
     <PackageReference Include="Dirkster.AvalonDock.Themes.VS2013" Version="4.72.1" />
+    <!-- 子进程侧用 Host.CreateApplicationBuilder() 起一个通用 Host(只当 DI/日志容器用,
+         WPF 消息循环仍由 ChildProgram.Run 里的 Application.Run 驱动,不靠 IHost 跑
+         hosted service);子进程是 WinExe 无控制台,日志落地选 AddDebug()(输出到
+         Visual Studio 的"输出"窗口),不用 Console provider。Hosting/Logging.Debug 这些
+         包已经随上面的 FrameworkReference(Microsoft.AspNetCore.App)一起可用,不用再
+         显式加 PackageReference(加了会触发 NU1510:该包会被裁剪,多余)。 -->
   </ItemGroup>
 
   <ItemGroup>

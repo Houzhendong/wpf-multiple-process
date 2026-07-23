@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Windows.Threading;
+using Microsoft.Extensions.Logging;
 using WpfMultiProcess.Ipc.Common;
 
 namespace WpfMultiProcess.Child;
@@ -46,6 +47,7 @@ public sealed class UiSaturationMeter : IDisposable
     private readonly Dispatcher _dispatcher;
     private readonly CommonService.CommonServiceClient _common;
     private readonly string _sessionId;
+    private readonly ILogger<UiSaturationMeter> _logger;
     private readonly CancellationTokenSource _cts = new();
 
     /// <summary>OperationPosted→OperationStarted 之间的排队延迟计算:key 是
@@ -70,11 +72,13 @@ public sealed class UiSaturationMeter : IDisposable
     private double _longestOpMsWindow;
     private int _opCountWindow;
 
-    public UiSaturationMeter(Dispatcher dispatcher, CommonService.CommonServiceClient common, string sessionId)
+    public UiSaturationMeter(Dispatcher dispatcher, CommonService.CommonServiceClient common, string sessionId,
+        ILogger<UiSaturationMeter> logger)
     {
         _dispatcher = dispatcher;
         _common = common;
         _sessionId = sessionId;
+        _logger = logger;
     }
 
     /// <summary>必须在 UI 线程调用(ChildShell.SourceInitialized 之后,channel/client
@@ -264,6 +268,11 @@ public sealed class UiSaturationMeter : IDisposable
     private async Task ReportAsync(UiStatsRequest req)
     {
         try { await _common.ReportUiStatsAsync(req).ResponseAsync; }
-        catch { /* 主进程不可达时忽略,下个窗口继续尝试 */ }
+        catch (Exception ex)
+        {
+            // 主进程不可达时忽略,下个窗口继续尝试——Debug 级别记一笔纯诊断日志,
+            // 不改变"静默容忍、下个窗口重试"这个既有行为。
+            _logger.LogDebug(ex, "ReportUiStats failed for session {SessionId}", _sessionId);
+        }
     }
 }

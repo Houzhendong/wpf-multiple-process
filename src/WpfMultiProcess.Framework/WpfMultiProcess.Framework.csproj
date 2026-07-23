@@ -20,6 +20,10 @@
   <ItemGroup>
     <PackageReference Include="Grpc.AspNetCore" Version="2.71.0" />
     <PackageReference Include="Grpc.Net.Client" Version="2.71.0" />
+    <!-- ChildProgram.Run(IHost, ...) 用到的 IHost/IServiceProvider,以及 SessionManager/
+         CommonServiceImpl 用到的 ILogger&lt;T&gt;,都已经随上面的 FrameworkReference
+         (Microsoft.AspNetCore.App 共享框架自带 Hosting/Logging Abstractions)一起可用,
+         不需要再显式加 PackageReference——加了反而会触发 NU1510(该包会被裁剪,多余)。 -->
   </ItemGroup>
 
   <!-- 只有 common.proto 在这里编译(GrpcServices=Both):CommonService + 共享消息类型

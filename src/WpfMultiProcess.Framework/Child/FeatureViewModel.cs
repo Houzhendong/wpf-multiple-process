@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using Grpc.Core;
+using Microsoft.Extensions.Logging;
 using WpfMultiProcess.Ipc.Common;
 
 namespace WpfMultiProcess.Child;
@@ -40,11 +41,11 @@ public abstract class FeatureViewModel : INotifyPropertyChanged, IDisposable
     /// 落到这两个方法上。</summary>
     protected void HandlePing(Ping ping) => Shell.SendPong(ping);
 
-    /// <summary>Shutdown→关子窗口。reason 只用于诊断日志(M5 会接入 ILogger 后此处改为
-    /// 结构化输出),不影响"收到就关窗口"这个行为本身。</summary>
+    /// <summary>Shutdown→关子窗口。reason/detail 只用于诊断日志(经 Shell.Logger 结构化
+    /// 输出),不影响"收到就关窗口"这个行为本身。</summary>
     protected void HandleShutdown(Shutdown shutdown)
     {
-        System.Diagnostics.Debug.WriteLine($"[FeatureViewModel] Shutdown reason={shutdown.Reason} detail={shutdown.Detail}");
+        Shell.Logger.LogInformation("Shutdown received: reason={Reason} detail={Detail}", shutdown.Reason, shutdown.Detail);
         Shell.RequestClose();
     }
 
