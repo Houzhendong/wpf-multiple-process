@@ -15,6 +15,10 @@ service CommonService {
 
   // 子进程被点击(WS_EX_NOACTIVATE 拦掉了自然激活)时上报,换取主进程 Activate() 补偿。
   rpc RequestActivate (ActivateRequest) returns (Ack);
+
+  // 子进程 UiSaturationMeter 后台线程每窗口(约 1s)上报一次 UI 线程饱和度,
+  // fire-and-forget,和 Pong 共用同一个 CommonServiceClient/Channel。
+  rpc ReportUiStats (UiStatsRequest) returns (Ack);
 }
 
 // Register 时回给子进程的展示元数据,现在搭在各 feature 自己 stream 的 XxxDown
@@ -34,6 +38,18 @@ message PongRequest {
 
 message ActivateRequest {
   string session_id = 1;
+}
+
+// UiSaturationMeter 每窗口上报一次:saturation_pct 是后台线程 Background 优先级探针
+// 积分出来的权威值(UI 卡死进行中也能报出接近 100%);其余四个字段来自
+// Dispatcher.Hooks,只做归因,不作为"是否饱和"的判据。
+message UiStatsRequest {
+  string session_id = 1;
+  double saturation_pct = 2;         // 探针权威值
+  double dispatcher_busy_pct = 3;    // hooks
+  double max_queue_latency_ms = 4;   // hooks
+  double longest_op_ms = 5;          // hooks
+  int32  op_count = 6;               // hooks
 }
 
 message Ack {

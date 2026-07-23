@@ -17,10 +17,12 @@ namespace WpfMultiProcess.Child;
 /// 子进程不再有独立的 ChildSession 对象:session_id 由主进程生成、随 --session
 /// 启动参数传入(见 Program.CmdLine),ChildShell 直接持有 gRPC 通道 + session_id +
 /// 自己的 hwnd,并在同一个 channel 上额外建一个 CommonService 客户端——Pong/
-/// RequestActivate 这两个 feature-无关的 unary 就用它,是普通的 fire-and-forget
-/// unary 调用,不是往 bidi stream 里写,没有并发写同一条 stream 的坑。真正的数据流
-/// 由 feature 视图自己开(见 IFeatureChildModule.CreateView(ChildContext)),demux
-/// 出来的 Control 转发回这里的 OnPing/RequestClose,ApplyReply 用 Register 流第一条
+/// RequestActivate/ReportUiStats 这几个 feature-无关的 unary 就用它,都是普通的
+/// fire-and-forget unary 调用,不是往 bidi stream 里写,没有并发写同一条 stream 的坑。
+/// 同样是框架级、feature-无关的还有 <see cref="UiSaturationMeter"/>(UI 线程饱和度
+/// 探针+归因遥测),SourceInitialized 建好 channel/client 后立即拉起,Closed 时停掉。
+/// 真正的数据流由 feature 视图自己开(见 IFeatureChildModule.CreateView(ChildContext)),
+/// demux 出来的 Control 转发回这里的 OnPing/RequestClose,ApplyReply 用 Register 流第一条
 /// Reply 设标题/主题色。顶部框架状态条(标题/心跳文本 + "模拟卡死 10s" 按钮)是框架级
 /// 调试 affordance,与具体 feature 无关,因此留在这里而不是下沉到 feature 视图。
 /// </summary>
@@ -41,6 +43,7 @@ public sealed class ChildShell : Window
 
     private GrpcChannel? _channel;
     private CommonService.CommonServiceClient? _common;
+    private UiSaturationMeter? _uiSaturation;
 
     /// <summary>SourceInitialized 里拿到的自己窗口句柄,随开流请求带给主进程(不再单独
     /// 有一次 RegisterWindow RPC)。</summary>
@@ -66,7 +69,11 @@ public sealed class ChildShell : Window
         Content = BuildLayout();
 
         SourceInitialized += (_, _) => OnSourceInitialized();
-        Closed += (_, _) => _channel?.Dispose();
+        Closed += (_, _) =>
+        {
+            _uiSaturation?.Dispose();
+            _channel?.Dispose();
+        };
 
         // 点击子窗口本身不应该抢激活(WS_EX_NOACTIVATE 拦不到的场景兜底见下),
         // 但主进程侧仍希望"我被点了"能把宿主提到前面,所以点击时 fire-and-forget
@@ -174,9 +181,15 @@ public sealed class ChildShell : Window
             HwndSource.FromHwnd(Hwnd)?.AddHook(OnWndProc);
 
             // 1) 建 UDS 通道,并在同一个 channel 上额外建一个 CommonService 客户端
-            // (Pong/RequestActivate 这两个 feature-无关 unary 用)。
+            // (Pong/RequestActivate/ReportUiStats 这几个 feature-无关 unary 用)。
             _channel = GrpcUds.CreateChannel(_opts.SocketPath);
             _common = new CommonService.CommonServiceClient(_channel);
+
+            // 1.5) UiSaturationMeter 是框架级、feature-无关的:探针(后台线程)+
+            // Dispatcher.Hooks(UI 线程注册)一起构成"UI 线程饱和度"遥测,和具体
+            // feature 视图完全无关,所以在这里(而不是某个 feature 视图里)拉起。
+            _uiSaturation = new UiSaturationMeter(Dispatcher, _common, SessionId);
+            _uiSaturation.Start();
 
             // 2) 把 ChildContext 交给 feature 模块生成视图,塞进中间区域;该 feature
             // 自己的 gRPC stream(Register 带 session_id/hwnd/pid,返回带 Reply/Control

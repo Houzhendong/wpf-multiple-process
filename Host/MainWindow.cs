@@ -9,6 +9,7 @@ using AvalonDock;
 using AvalonDock.Layout;
 using AvalonDock.Themes;
 using WpfMultiProcess.Host.Session;
+using WpfMultiProcess.Ipc.Common;
 
 namespace WpfMultiProcess.Host;
 
@@ -24,8 +25,20 @@ public sealed class MainWindow : Window
     private readonly Dictionary<string, Process> _children = new();
     private readonly ObservableCollection<string> _log = new();
     private readonly TextBlock _status = new() { Margin = new Thickness(6, 2, 6, 2) };
+    // 每个 feature 一行,展示 UiSaturationMeter 最新一次上报;独立于上面的心跳 RTT 状态条,
+    // 两条通道互不覆盖。
+    private readonly TextBlock _uiStats = new() { Margin = new Thickness(6, 0, 6, 2), FontSize = 11 };
+    private readonly Dictionary<string, string> _uiStatsLines = new();
+    private readonly Dictionary<string, bool> _uiStatsHigh = new();
+    private readonly Dictionary<string, long> _uiStatsLastLogMs = new();
     private static readonly SolidColorBrush StatusBarNormalBrush = new(Color.FromRgb(0x00, 0x7A, 0xCC));
     private static readonly SolidColorBrush StatusBarUnresponsiveBrush = new(Color.FromRgb(0xC4, 0x2B, 0x1E));
+    /// <summary>持续高位判定阈值:探针 saturation_pct 超过这个百分比才算"饱和",
+    /// 和心跳的 UnresponsiveThresholdMs 是两个独立维度(一个测 UI 有没有空闲容量,
+    /// 一个测有没有彻底失联)。</summary>
+    private const double HighSaturationPct = 80;
+    /// <summary>持续高位期间,事件日志最多每隔这么久重复记一条,避免刷屏。</summary>
+    private const long HighSaturationLogIntervalMs = 2000;
     private Border _statusBar = null!;
     private LayoutDocumentPane _docPane = null!;
     private DockingManager _dockingManager = null!;
@@ -115,13 +128,18 @@ public sealed class MainWindow : Window
             });
         }
 
+        var statusStack = new StackPanel { Orientation = Orientation.Vertical };
+        statusStack.Children.Add(_status);
+        statusStack.Children.Add(_uiStats);
         _statusBar = new Border
         {
             Background = StatusBarNormalBrush,
-            Child = _status,
+            Child = statusStack,
         };
         _status.Foreground = Brushes.White;
         _status.Text = "等待子进程连接…";
+        _uiStats.Foreground = Brushes.White;
+        _uiStats.Text = "UI 饱和度:等待上报…";
 
         var grid = new Grid();
         grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
@@ -185,6 +203,31 @@ public sealed class MainWindow : Window
                 Log($"[{f}] UI 线程已恢复");
                 _statusBar.Background = StatusBarNormalBrush;
             });
+
+        _hub.UiStatsReceived += (f, stats) => Dispatcher.BeginInvoke(() => OnUiStats(f, stats));
+    }
+
+    /// <summary>UiSaturationMeter 每窗口(约 1s)上报一次;每个 feature 单独一行,
+    /// 拼成一条文本显示,不覆盖上面的心跳 RTT 状态条。saturation_pct 持续 &gt;80%
+    /// 时在事件日志记一条,只在状态翻转或每 ~2s 记一次,避免刷屏。</summary>
+    private void OnUiStats(string featureId, UiStatsRequest stats)
+    {
+        _uiStatsLines[featureId] =
+            $"[{featureId}] UI 饱和 {stats.SaturationPct:F0}% " +
+            $"(dispatcher 忙 {stats.DispatcherBusyPct:F0}%, 队列 {stats.MaxQueueLatencyMs:F0}ms, 最长 {stats.LongestOpMs:F0}ms)";
+        _uiStats.Text = string.Join("    ", _registry.Modules
+            .Select(m => _uiStatsLines.TryGetValue(m.FeatureId, out var line) ? line : $"[{m.FeatureId}] 等待上报…"));
+
+        bool isHigh = stats.SaturationPct > HighSaturationPct;
+        bool wasHigh = _uiStatsHigh.TryGetValue(featureId, out var prev) && prev;
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        long lastLog = _uiStatsLastLogMs.GetValueOrDefault(featureId);
+        if (isHigh && (!wasHigh || now - lastLog > HighSaturationLogIntervalMs))
+        {
+            Log($"[{featureId}] ⚠ UI 饱和度 {stats.SaturationPct:F0}% (持续高位)");
+            _uiStatsLastLogMs[featureId] = now;
+        }
+        _uiStatsHigh[featureId] = isHigh;
     }
 
     private void LaunchChild(string featureId)

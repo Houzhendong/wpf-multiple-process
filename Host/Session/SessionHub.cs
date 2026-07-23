@@ -50,6 +50,9 @@ public sealed class SessionHub : IDisposable
     public event Action<string>? ActivateRequested;             // featureId
     /// <summary>feature service 记业务日志到主窗口,和框架自身的连接/心跳日志分开。</summary>
     public event Action<string, string>? FeatureLog;
+    /// <summary>featureId, 子进程 UiSaturationMeter 每窗口(约 1s)上报一次的 UI 线程
+    /// 饱和度遥测,和心跳的 Pong/RTT 是两条独立的通道。</summary>
+    public event Action<string, UiStatsRequest>? UiStatsReceived;
 
     public SessionHub(HostFeatureRegistry registry)
     {
@@ -105,6 +108,15 @@ public sealed class SessionHub : IDisposable
     {
         if (_sessions.TryGetValue(sessionId, out var info))
             ActivateRequested?.Invoke(info.FeatureId);
+    }
+
+    /// <summary>CommonServiceImpl.ReportUiStats 收到子进程上报后调用:按 session_id
+    /// 找到 featureId,原样把整个请求抛给 UI——极薄路由,不做任何聚合/判定,
+    /// 阈值判断(比如"持续 >80% 记一条日志")留给 MainWindow 自己维护状态。</summary>
+    public void OnUiStats(UiStatsRequest request)
+    {
+        if (_sessions.TryGetValue(request.SessionId, out var info))
+            UiStatsReceived?.Invoke(info.FeatureId, request);
     }
 
     /// <summary>feature service 的 Register 拿到 Subscription 后调用,把它挂进心跳循环。</summary>
