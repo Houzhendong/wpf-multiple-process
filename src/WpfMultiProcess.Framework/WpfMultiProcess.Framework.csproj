@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>WpfMultiProcess.Framework</AssemblyName>
+    <RootNamespace>WpfMultiProcess</RootNamespace>
+  </PropertyGroup>
+
+  <!-- gRPC 服务端(Kestrel)需要 ASP.NET Core 共享框架:SessionManager/CommonServiceImpl
+       等主进程侧类型需要 IEndpointRouteBuilder/ServerCallContext 等类型。 -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Grpc.AspNetCore" Version="2.71.0" />
+    <PackageReference Include="Grpc.Net.Client" Version="2.71.0" />
+  </ItemGroup>
+
+  <!-- 只有 common.proto 在这里编译(GrpcServices=Both):CommonService + 共享消息类型
+       (RegisterReply/Control/Ping/Shutdown/Ack/...)归框架程序集所有。demo 的
+       feature proto import 这个文件时不重复生成,只经 AdditionalImportDirs 解析。 -->
+  <ItemGroup>
+    <Protobuf Include="Protos\common.proto" ProtoRoot="Protos" GrpcServices="Both" />
+  </ItemGroup>
+
+</Project>

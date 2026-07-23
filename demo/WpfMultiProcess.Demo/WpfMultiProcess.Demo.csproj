@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>WpfMultiProcess.Demo</AssemblyName>
+    <RootNamespace>WpfMultiProcess.Demo</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Grpc.AspNetCore" Version="2.71.0" />
+    <PackageReference Include="Grpc.Net.Client" Version="2.71.0" />
+    <PackageReference Include="Dirkster.AvalonDock" Version="4.72.1" />
+    <PackageReference Include="Dirkster.AvalonDock.Themes.VS2013" Version="4.72.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\WpfMultiProcess.Framework\WpfMultiProcess.Framework.csproj" />
+  </ItemGroup>
+
+  <!-- waveform/table.proto import "common.proto",但 common.proto 本身不在这里编译
+       (不 Include 它),只靠 AdditionalImportDirs 让 protoc 能解析 import、找到
+       ipc.common.* 的 csharp_namespace 声明;真正的 WpfMultiProcess.Ipc.Common.*
+       类型来自 ProjectReference 的 Framework 程序集,避免重复生成同名类型冲突。 -->
+  <ItemGroup>
+    <Protobuf Include="Protos\waveform.proto" ProtoRoot="Protos" GrpcServices="Both"
+              AdditionalImportDirs="..\..\src\WpfMultiProcess.Framework\Protos" />
+    <Protobuf Include="Protos\table.proto" ProtoRoot="Protos" GrpcServices="Both"
+              AdditionalImportDirs="..\..\src\WpfMultiProcess.Framework\Protos" />
+  </ItemGroup>
+
+</Project>

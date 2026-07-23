@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/demo/">
+    <Project Path="demo/WpfMultiProcess.Demo/WpfMultiProcess.Demo.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/WpfMultiProcess.Framework/WpfMultiProcess.Framework.csproj" />
+  </Folder>
+</Solution>
