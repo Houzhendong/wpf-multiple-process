@@ -7,7 +7,9 @@ public static partial class Win32
     public const int GWLP_HWNDPARENT = -8;
     public const int GWL_EXSTYLE = -20;
 
-    public const uint WS_EX_NOACTIVATE = 0x08000000;
+    // WS_EX_NOACTIVATE 已经不再使用(问题 1 修复:子窗口全部改为可激活,否则键盘
+    // 输入永远进不去,详见 ChildWindow),但 WS_EX_TOOLWINDOW 仍然保留——它只影响
+    // 任务栏/Alt-Tab 可见性,和激活行为无关。
     public const uint WS_EX_TOOLWINDOW = 0x00000080;
 
     public const uint SWP_NOSIZE = 0x0001;
@@ -39,8 +41,6 @@ public static partial class Win32
     public const uint GW_HWNDPREV = 3;
 
     public const int WM_WINDOWPOSCHANGED = 0x0047;
-    public const int WM_MOUSEACTIVATE = 0x0021;
-    public const nint MA_NOACTIVATE = 3;
 
     [LibraryImport("user32.dll", EntryPoint = "SetWindowLongPtrW", SetLastError = true)]
     public static partial nint SetWindowLongPtr(nint hWnd, int nIndex, nint dwNewLong);

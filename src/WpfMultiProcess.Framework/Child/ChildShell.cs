@@ -9,10 +9,16 @@ namespace WpfMultiProcess.Child;
 /// Window 子类,身兼"窗口长什么样"和"会话怎么编排"两件事,现在拆成 ChildWindow(纯
 /// 视图容器)+ 这个类):持有 ChildWindow + gRPC 通道 + session_id/featureId/
 /// featureIndex + 在同一个 channel 上额外建的 CommonService 客户端(Pong/
-/// RequestActivate/ReportUiStats 这几个 feature-无关的 unary 用它,都是普通
-/// fire-and-forget unary 调用,不是往 bidi stream 里写,没有并发写同一条 stream 的坑),
-/// 以及框架级、feature-无关的 <see cref="UiSaturationMeter"/>(UI 线程饱和度探针+归因
-/// 遥测)。
+/// ReportUiStats 这几个 feature-无关的 unary 用它,都是普通 fire-and-forget unary
+/// 调用,不是往 bidi stream 里写,没有并发写同一条 stream 的坑),以及框架级、
+/// feature-无关的 <see cref="UiSaturationMeter"/>(UI 线程饱和度探针+归因遥测)。
+///
+/// 原来这里还有一个 RequestActivate:子窗口是 WS_EX_NOACTIVATE 时点击不会自己抢
+/// 激活,靠这个 unary 上报"我被点了"换取主进程 Activate() 补偿。子窗口改为全部
+/// 可激活后(见 ChildWindow),点击会被系统正常处理,这条补偿链存在的理由消失,
+/// 整条删掉了(CommonService.proto 的 rpc、CommonServiceImpl 的实现、
+/// SessionManager.OnActivate/ActivateRequested、这里的 RequestActivate 方法、
+/// ChildWindow 的 PreviewMouseDown 上报、demo MainWindow 的订阅,全部一起删)。
 ///
 /// 真正的数据流由 feature 自己的 <see cref="FeatureViewModel{TDown}"/> 开,demux 出来的
 /// Reply/Ping/Shutdown(XxxDown oneof 的三个 feature-无关分支)转发回这里对应的方法:
@@ -51,11 +57,6 @@ public sealed class ChildShell : IDisposable
         _common = new CommonService.CommonServiceClient(channel);
         _loggerFactory = loggerFactory;
         Logger = loggerFactory.CreateLogger<ChildShell>();
-
-        // 点击子窗口本身不应该抢激活(WS_EX_NOACTIVATE 拦不到的场景兜底见 ChildWindow),
-        // 但主进程侧仍希望"我被点了"能把宿主提到前面,所以点击时 fire-and-forget
-        // 上报一次 RequestActivate,不阻塞输入本身。
-        Window.ActivateRequested += RequestActivate;
     }
 
     /// <summary>UiSaturationMeter 是框架级、feature-无关的:探针(后台线程)+
@@ -66,17 +67,6 @@ public sealed class ChildShell : IDisposable
     {
         _uiSaturation = new UiSaturationMeter(Window.Dispatcher, _common, SessionId, _loggerFactory.CreateLogger<UiSaturationMeter>());
         _uiSaturation.Start();
-    }
-
-    /// <summary>子窗口是 WS_EX_NOACTIVATE,点击不会自己抢激活,fire-and-forget 上报一次
-    /// 换取主进程 Activate() 补偿。普通 unary 调用,和 Pong 共用同一个 CommonService
-    /// 客户端、同一个 channel,没有 bidi 写并发的坑。</summary>
-    public void RequestActivate() => _ = RequestActivateCoreAsync();
-
-    private async Task RequestActivateCoreAsync()
-    {
-        try { await _common.RequestActivateAsync(new ActivateRequest { SessionId = SessionId }).ResponseAsync; }
-        catch { /* 主进程不可达时忽略,不影响窗口自身交互 */ }
     }
 
     /// <summary>feature 视图模型从自己 stream 里 demux 出 Ping 后调用:在 UI 线程

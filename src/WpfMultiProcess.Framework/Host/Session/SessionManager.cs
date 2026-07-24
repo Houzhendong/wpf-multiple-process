@@ -68,7 +68,6 @@ public sealed class SessionManager : IDisposable
     /// <summary>sessionId, featureId, 已失联毫秒数。</summary>
     public event Action<string, string, double>? UiUnresponsive;
     public event Action<string, string>? UiRecovered;
-    public event Action<string, string>? ActivateRequested;         // sessionId, featureId
     /// <summary>feature service 记业务日志到主窗口,和框架自身的连接/心跳日志分开;
     /// tag 由调用方自己拼(通常是 "{featureId}#{featureIndex}"),SessionManager 不关心格式。</summary>
     public event Action<string, string>? FeatureLog;
@@ -297,12 +296,6 @@ public sealed class SessionManager : IDisposable
         double rtt = NowMs() - request.PingTimestampMs;
         session.OnPong(request.Seq, rtt);
         PongReceived?.Invoke(sessionId, entry.FeatureId, request.Seq, rtt);
-    }
-
-    public void OnActivate(string sessionId)
-    {
-        if (_entries.TryGetValue(sessionId, out var entry))
-            ActivateRequested?.Invoke(sessionId, entry.FeatureId);
     }
 
     /// <summary>CommonServiceImpl.ReportUiStats 收到子进程上报后调用:按 session_id

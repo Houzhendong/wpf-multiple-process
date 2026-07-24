@@ -50,7 +50,13 @@ public sealed class MainWindow : Window
     private const long HighSaturationLogIntervalMs = 2000;
 
     private readonly Border _statusBar;
+    // 两个左右并排的 LayoutDocumentPane,验证问题 2(平铺布局下 Z 序收敛):波形和表格
+    // 各自固定分到一个 pane,一开就同时可见、同一个宿主根 HWND 下有两个 overlay 同时
+    // 显示,是最直接触发"两个 overlay 互抢宿主正上方"这个 bug 的场景。选"按 featureId
+    // 固定分栏"而不是"新开的永远进右边"之类更复杂的布局策略,是因为这是验证 Z 序链
+    // 协调者最简单、最容易复现/观察的稳定布局,不需要额外 UI 操作。
     private readonly LayoutDocumentPane _docPane;
+    private readonly LayoutDocumentPane _docPane2;
     private readonly DockingManager _dockingManager;
 
     private SessionManager? _sessionManager;
@@ -63,6 +69,7 @@ public sealed class MainWindow : Window
 
         _dockingManager = new DockingManager { Theme = new Vs2013DarkTheme() };
         _docPane = new LayoutDocumentPane();
+        _docPane2 = new LayoutDocumentPane();
 
         _statusBar = BuildStatusBar();
         Content = BuildLayout();
@@ -105,7 +112,10 @@ public sealed class MainWindow : Window
 
         string title = FeatureTitles.TryGetValue(featureId, out var t) ? t : featureId;
         var document = new LayoutDocument { Title = $"{title} #{index}", ContentId = Guid.NewGuid().ToString() };
-        _docPane.Children.Add(document);
+        // 平铺布局(见字段注释):table 固定分到右边那个 pane,其余(waveform 等)
+        // 都进左边,两个 pane 同时可见时同一宿主根 HWND 下会有两个 overlay 同时显示。
+        var targetPane = featureId == "table" ? _docPane2 : _docPane;
+        targetPane.Children.Add(document);
         var pane = new AvalonDockPane(document);
 
         _sessionManager.OpenFeature(featureId, index, pane);
@@ -118,6 +128,7 @@ public sealed class MainWindow : Window
         // 要在整棵 Layout 树(Descendents())里找,浮动/停靠状态下都能定位到它。
         var allDocs = _dockingManager.Layout.Descendents().OfType<LayoutDocument>().ToList();
         var doc = _docPane.SelectedContent as LayoutDocument
+                  ?? _docPane2.SelectedContent as LayoutDocument
                   ?? allDocs.FirstOrDefault(d => d.IsActive)
                   ?? allDocs.FirstOrDefault();
         if (doc is null)
@@ -156,9 +167,16 @@ public sealed class MainWindow : Window
         var logAnchorable = new LayoutAnchorable { Title = "事件日志", ContentId = "log", Content = logList };
         var bottomPane = new LayoutAnchorablePane(logAnchorable) { DockHeight = new GridLength(180) };
 
+        // 左右两个 LayoutDocumentPane 水平并排(见字段注释),启动即平铺、两个 pane
+        // 同时可见——不需要额外的“强制平铺”按钮或用户操作,复现问题 2 的最简布局。
+        // LayoutPanel 没有接受多个子节点的构造函数,只能先建空的再 Add。
+        var horizontalPanel = new LayoutPanel { Orientation = Orientation.Horizontal };
+        horizontalPanel.Children.Add(_docPane);
+        horizontalPanel.Children.Add(_docPane2);
+
         _dockingManager.Layout = new LayoutRoot
         {
-            RootPanel = new LayoutPanel(new LayoutPanel(_docPane) { Orientation = Orientation.Horizontal })
+            RootPanel = new LayoutPanel(horizontalPanel)
             {
                 Orientation = Orientation.Vertical,
                 Children = { bottomPane },
@@ -216,15 +234,6 @@ public sealed class MainWindow : Window
 
         sessionManager.WindowRegistered += (sessionId, featureId, hwnd) =>
             Dispatcher.BeginInvoke(() => Log($"[{SessionTag(sessionId, featureId)}] 收到 HWND 0x{hwnd:X},执行 overlay"));
-
-        sessionManager.ActivateRequested += (_, _) =>
-            Dispatcher.BeginInvoke(() =>
-            {
-                // 子窗口现在是 WS_EX_NOACTIVATE,点击不会自己抢激活/提 Z 序,
-                // 这里补偿式地把主窗口(宿主)激活一下,换取"点了有反应"的体验。
-                // 每次点击都会触发,不写事件日志,避免刷屏。
-                Activate();
-            });
 
         sessionManager.FeatureLog += (tag, message) =>
             Dispatcher.BeginInvoke(() => Log($"[{tag}] {message}"));

@@ -1,5 +1,6 @@
 using System.Linq;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Data;
 using System.Windows.Media;
@@ -14,6 +15,12 @@ namespace WpfMultiProcess.Demo.Child.Features.Waveform;
 /// 停止重绘,避免拖慢主进程异步 SetWindowPos 位置纠正的处理),加一个"统计"按钮调用
 /// ViewModel.ShowStatisticsAsync。曲线数据/流 demux 全部下沉到 WaveformViewModel,这里
 /// 只管画。
+///
+/// "键盘测试"输入框是问题 1(子窗口键盘输入)的验证 affordance:子窗口早先用
+/// WS_EX_NOACTIVATE + 拦截 WM_MOUSEACTIVATE 禁止激活时,点这个 TextBox 根本拿不到
+/// 焦点,连字符都打不进去;子窗口改为完全可激活后,点击→系统激活→TextBox 拿到键盘
+/// 焦点→正常输入,这里能不能正常打字就是最直观的回归验证点。挂
+/// AutomationProperties.AutomationId 是为了 UI Automation 测试脚本能定位到它。
 /// </summary>
 public sealed class WaveformView : UserControl
 {
@@ -44,9 +51,29 @@ public sealed class WaveformView : UserControl
         statsButton.Click += async (_, _) => await _vm.ShowStatisticsAsync();
         _statsText.SetBinding(TextBlock.TextProperty, new Binding(nameof(WaveformViewModel.StatsText)));
 
+        var keyboardTestLabel = new TextBlock
+        {
+            Text = "键盘测试:",
+            Foreground = Brushes.Gray,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(8, 0, 4, 0),
+        };
+        var keyboardTestBox = new TextBox
+        {
+            Width = 160,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 4, 8, 4),
+        };
+        AutomationProperties.SetAutomationId(keyboardTestBox, "WaveformKeyboardTestBox");
+        var keyboardTestPanel = new StackPanel { Orientation = Orientation.Horizontal };
+        keyboardTestPanel.Children.Add(keyboardTestLabel);
+        keyboardTestPanel.Children.Add(keyboardTestBox);
+
         var footer = new DockPanel();
         DockPanel.SetDock(statsButton, Dock.Left);
+        DockPanel.SetDock(keyboardTestPanel, Dock.Right);
         footer.Children.Add(statsButton);
+        footer.Children.Add(keyboardTestPanel);
         footer.Children.Add(_statsText);
 
         var root = new DockPanel();

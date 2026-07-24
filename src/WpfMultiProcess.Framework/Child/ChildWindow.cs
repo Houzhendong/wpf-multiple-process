@@ -7,12 +7,28 @@ using WpfMultiProcess.Ipc;
 namespace WpfMultiProcess.Child;
 
 /// <summary>
-/// 子进程窗口(纯视图容器,从原 ChildShell 拆分出来):Win32 摆位/激活拦截部分原样
-/// 保留——WindowStyle=None、不进任务栏、初始位置屏幕外、SourceInitialized 加
-/// WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW、拦 WM_MOUSEACTIVATE 返回 MA_NOACTIVATE、
-/// 点击触发 <see cref="ActivateRequested"/>(由 ChildShell 订阅,fire-and-forget 上报
-/// 换取主进程 Activate() 补偿)。顶部框架状态条(标题/心跳文本 + "模拟卡死 10s" 按钮)
-/// 是框架级调试 affordance,和具体 feature 无关,因此留在这里而不是下沉到 feature 视图。
+/// 子进程窗口(纯视图容器,从原 ChildShell 拆分出来):Win32 摆位部分原样保留——
+/// WindowStyle=None、不进任务栏、初始位置屏幕外、SourceInitialized 加
+/// WS_EX_TOOLWINDOW(仍然不进 Alt-Tab/任务栏)。顶部框架状态条(标题/心跳文本 +
+/// "模拟卡死 10s" 按钮)是框架级调试 affordance,和具体 feature 无关,因此留在这里
+/// 而不是下沉到 feature 视图。
+///
+/// 问题 1 修复(键盘输入):早期方案给子窗口加 WS_EX_NOACTIVATE + 拦截
+/// WM_MOUSEACTIVATE→MA_NOACTIVATE,点击不激活、也不打扰 OverlayHost 手动维护的
+/// Z 序,代价是子窗口永远拿不到键盘焦点——Windows 的键盘输入路由到"当前激活窗口
+/// 所在线程的焦点控件",一个永远不会被激活的窗口里,TextBox/Tab 导航/快捷键全部
+/// 失效。这个代价无法接受(子进程里跑的是真实业务 UI,不是纯展示),所以这里整个
+/// 去掉 WS_EX_NOACTIVATE 和 WM_MOUSEACTIVATE 钩子,子窗口恢复成完全可激活——
+/// 点击子窗口会被系统正常激活、拿到键盘焦点,配合 <see cref="ShowActivated"/> = false
+/// 只是让它初次显示时不抢焦点。随之而来的连带影响:
+///   1. 点击子窗口会把主窗口标题栏变成非活动状态(系统级激活语义决定的,没有 owner
+///      关系就没有"一起高亮"这回事)——这是本设计(无 owner、跨进程嵌入)必须接受
+///      的固有代价,不再用 RequestActivate 补偿(那条链路已整条删除,见
+///      ChildShell/CommonService/SessionManager)。
+///   2. 激活会把窗口提到系统 Z 序同级最前,这会扰乱 OverlayHost 手动维护的层叠
+///      顺序——已经由 Host.OverlayZOrderCoordinator 通过"宿主
+///      WM_WINDOWPOSCHANGED → 重新钉链条"的既有兜底路径处理,不需要子窗口这边
+///      再做什么。
 ///
 /// 真正的会话编排(channel/session_id/心跳协议/UiSaturationMeter)全部下沉到
 /// ChildShell,这里只管"窗口长什么样、Win32 怎么摆位、feature 视图往哪塞"——feature
@@ -39,10 +55,6 @@ public sealed class ChildWindow : Window
     /// 建 channel/ChildShell(需要 Hwnd 随开流请求带给主进程)。</summary>
     public event Action? SourceReady;
 
-    /// <summary>子窗口是 WS_EX_NOACTIVATE,点击不会自己抢激活;这里把"被点了"这件事
-    /// 转发出去,ChildShell 订阅后 fire-and-forget 上报 RequestActivate。</summary>
-    public event Action? ActivateRequested;
-
     public ChildWindow()
     {
         // 无边框工具窗:由主进程摆位,自己不参与任务栏/Alt-Tab
@@ -58,10 +70,6 @@ public sealed class ChildWindow : Window
         Content = BuildLayout();
 
         SourceInitialized += (_, _) => OnSourceInitialized();
-
-        // 点击子窗口本身不应该抢激活(WS_EX_NOACTIVATE 拦不到的场景兜底见下),
-        // 但主进程侧仍希望"我被点了"能把宿主提到前面,所以点击时转发一次事件。
-        PreviewMouseDown += (_, _) => ActivateRequested?.Invoke();
     }
 
     /// <summary>bootstrap 建好 feature 视图后调用,塞进中间区域。</summary>
@@ -117,33 +125,13 @@ public sealed class ChildWindow : Window
 
     private void OnSourceInitialized()
     {
-        // 不再和宿主建立 owner 关系(见 OverlayHost 说明),子窗口自身改为不可激活的
-        // 工具窗:WS_EX_NOACTIVATE 让点击不抢激活焦点、不扰乱 OverlayHost 手动维护的
-        // Z 序;WS_EX_TOOLWINDOW 保持不进 Alt-Tab/任务栏。
+        // 不再和宿主建立 owner 关系(见 OverlayHost 说明);子窗口自身只保留
+        // WS_EX_TOOLWINDOW(不进 Alt-Tab/任务栏),不再设置 WS_EX_NOACTIVATE——
+        // 全部可激活,见类顶部注释。
         Hwnd = new WindowInteropHelper(this).Handle;
         nint exStyle = Win32.GetWindowLongPtr(Hwnd, Win32.GWL_EXSTYLE);
-        Win32.SetWindowLongPtr(Hwnd, Win32.GWL_EXSTYLE,
-            exStyle | (nint)(Win32.WS_EX_NOACTIVATE | Win32.WS_EX_TOOLWINDOW));
-
-        // WS_EX_NOACTIVATE 本身已经能挡掉大部分激活,这里再挂一层 WM_MOUSEACTIVATE
-        // 钩子保底:点击仍然正常派发鼠标消息(按钮能点),只是不激活窗口。
-        HwndSource.FromHwnd(Hwnd)?.AddHook(OnWndProc);
+        Win32.SetWindowLongPtr(Hwnd, Win32.GWL_EXSTYLE, exStyle | (nint)Win32.WS_EX_TOOLWINDOW);
 
         SourceReady?.Invoke();
-    }
-
-    /// <summary>
-    /// 拦 WM_MOUSEACTIVATE 返回 MA_NOACTIVATE:鼠标消息照常派发(按钮能点),
-    /// 但不激活本窗口——配合 WS_EX_NOACTIVATE 双保险,避免点击子窗口时把它
-    /// 激活到系统 Z 序最前、扰乱 OverlayHost 手动维护的层叠顺序。
-    /// </summary>
-    private nint OnWndProc(nint hwnd, int msg, nint wParam, nint lParam, ref bool handled)
-    {
-        if (msg == Win32.WM_MOUSEACTIVATE)
-        {
-            handled = true;
-            return Win32.MA_NOACTIVATE;
-        }
-        return 0;
     }
 }

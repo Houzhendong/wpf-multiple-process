@@ -54,7 +54,7 @@ Framework 一行代码；换一个 dock 库（比如 Infragistics `XamDockManage
 │    └── 状态栏/事件日志（订阅 SessionManager 的事件，含心跳 RTT + UI 饱和度遥测）         │
 │                                                                                          │
 │  CommonServiceImpl (Framework，feature 无关)         WaveformFeature/TableFeature (demo) │
-│    Pong/RequestActivate/ReportUiStats                  ├── WaveformServiceImpl          │
+│    Pong/ReportUiStats                                  ├── WaveformServiceImpl          │
 │      → 按 session_id 委托给 SessionManager             │    Register: 自己 new Session  │
 │                     ↓                                   │    → SessionManager.Register  │
 │  SessionManager (Framework)                             │    校验 → 写 Reply → 把        │
@@ -73,7 +73,7 @@ Framework 一行代码；换一个 dock 库（比如 Infragistics `XamDockManage
 ┌──────────────────────────────────────────┴───────────────── 子进程 (gRPC Client) ──────┐
 │  子进程入口 ChildProgram.Run(IHost host, ChildStartOptions, IReadOnlyList<IFeatureChild>)│
 │  ChildWindow/ChildShell (Framework)：WindowStyle=None, ShowInTaskbar=false,             │
-│  WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW，初始位置屏幕外，框架级状态条 + UiSaturationMeter     │
+│  仅 WS_EX_TOOLWINDOW（完全可激活），初始位置屏幕外，框架级状态条 + UiSaturationMeter     │
 │    1. host 只是 DI/日志容器（ILoggerFactory 从这里解析）：Application 实例也从           │
 │       host.Services 里取（不再 new Application()），调库方在自己 Program.cs 里          │
 │       注册想要的 Application（可以是子类，可以挂自定义资源），跑 app.Run(window)         │
@@ -84,8 +84,8 @@ Framework 一行代码；换一个 dock 库（比如 Infragistics `XamDockManage
 │    4. FeatureViewModel<TDown>.RunAsync 读 stream，逐条 envelope 调用具体 feature        │
 │       ViewModel 的 Dispatch：Reply→标题/主题色，Ping→回 Pong，Shutdown→关窗口，          │
 │       数据帧→OnData 更新绑定属性（波形折线 / DataGrid 行）                              │
-│    5. 点击子窗口 → ChildShell.RequestActivate() → CommonService.RequestActivate         │
-│       （子窗口不激活主窗口，靠这个 unary 补偿式激活主窗口）                             │
+│    5. 点击子窗口 → 系统正常激活该窗口、拿到键盘焦点（不再有 RequestActivate 补偿链，     │
+│       代价是主窗口标题栏随之失活，见下方"窗口嵌入"设计点）                              │
 │    6. feature 按钮（统计/排序/模拟卡死）→ 各自 feature 服务的 unary RPC 或本地操作       │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -212,13 +212,25 @@ Framework 一行代码；换一个 dock 库（比如 Infragistics `XamDockManage
   另一个子进程窗口的输入会被一起冻住，代价无法接受。现改为子窗口与宿主**没有任何
   系统级关系**：`OverlayHost` 只靠 `SetWindowPos` 持续把子窗口钉在占位控件的屏幕
   矩形上（`LayoutUpdated`/`LocationChanged`/`StateChanged`/宿主
-  `WM_WINDOWPOSCHANGED` 驱动），并且每次都显式算一遍 `hWndInsertAfter`（取宿主
-  `GW_HWNDPREV` 紧邻的窗口）手动把子窗口插到宿主正上方，靠"持续纠正 Z 序"代替
-  owner 关系。子窗口自身加 `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` 并拦截
-  `WM_MOUSEACTIVATE` 返回 `MA_NOACTIVATE`：点击不激活、不进 Alt-Tab/任务栏、也不会
-  自己扰乱这里维护的 Z 序；代价是点击子窗口不会带起主窗口，用一次
-  `CommonService.RequestActivate` unary（按 session_id 上报）换取主窗口
-  `Activate()` 补偿。**关键坑**：光去掉 owner 关系还不够——`SetWindowPos`/
+  `WM_WINDOWPOSCHANGED` 驱动），并且每次都显式算一遍 `hWndInsertAfter` 手动把
+  子窗口插到"参照物"正上方，靠"持续纠正 Z 序"代替 owner 关系。
+  子窗口自身**完全可激活**：只保留 `WS_EX_TOOLWINDOW`（不进 Alt-Tab/任务栏），
+  不再设置 `WS_EX_NOACTIVATE`，也不再拦截 `WM_MOUSEACTIVATE`——键盘输入需要
+  Windows 把窗口路由到"当前激活窗口所在线程的焦点控件"，一个永远不会被激活的
+  窗口里 TextBox/Tab 导航/快捷键全部失效，这个代价（原方案的初衷）无法接受，因为
+  子进程里跑的是真实业务 UI。随之而来的两个连带影响：
+  1. 点击子窗口会把主窗口标题栏变成非活动状态（系统级激活语义决定的，没有 owner
+     关系就没有"一起高亮"这回事）——这是本设计（无 owner、跨进程嵌入、子窗口
+     可激活）必须接受的固有代价，**不再用 `RequestActivate` 补偿**：那条
+     "点击子窗口 → unary 上报 → 主进程 `Activate()`"的链路已经整条删除
+     （`common.proto` 的 rpc、`CommonServiceImpl` 的实现、
+     `SessionManager.OnActivate`/`ActivateRequested`、`ChildShell.RequestActivate`
+     方法、`ChildWindow` 的鼠标上报、demo `MainWindow` 的订阅，全部一起删）。
+  2. 激活会把子窗口提到系统 Z 序同级最前，扰乱 `OverlayHost` 手动维护的层叠
+     顺序——不需要子窗口这边处理，靠宿主 `WM_WINDOWPOSCHANGED` 钩子在下一轮
+     触发时把 Z 序重新钉回去（见下方脏检查说明）。
+
+  **关键坑 1（异步 SetWindowPos）**：光去掉 owner 关系还不够——`SetWindowPos`/
   `ShowWindow` 对不同线程（含跨进程）的窗口默认会像 `SendMessage` 一样同步阻塞
   发消息，子窗口卡死时仍会拖住调用方所在的主进程 UI 线程。必须加上
   `SWP_ASYNCWINDOWPOS`（隐藏时用 `SetWindowPos`+`SWP_HIDEWINDOW` 代替
@@ -232,6 +244,35 @@ Framework 一行代码；换一个 dock 库（比如 Infragistics `XamDockManage
   一致就直接跳过）并把 `LayoutUpdated`/`IsVisibleChanged`/宿主
   `WM_WINDOWPOSCHANGED` 都改成 `Dispatcher.BeginInvoke` 去抖合并成一次；被切走
   隐藏的子窗口也暂停重绘。
+
+  **关键坑 2（平铺布局下的 Z 序互抢，`OverlayZOrderCoordinator`）**：早期实现里
+  每个 `OverlayHost` 都独立地把"宿主"当作唯一的 Z 序参照物（判据是"宿主正上方
+  紧邻的是不是我自己"）。tab 场景下同一时刻只有一个 overlay 可见，这条假设永远
+  成立；但平铺布局（同一宿主同时有多个可见 overlay，比如左右分栏同时显示
+  waveform+table）下，两个 overlay 会同时抢着"贴宿主正上方"这唯一的位置：A 先钉
+  完变成 `[A, host]`，B 检查发现"宿主正上方是 A 不是我"于是插进去变成
+  `[A, B, host]`，这时 A 再检查"宿主正上方现在是 B 不是我"又把自己插回去变成
+  `[B, A, host]`——两边的判据永远不可能同时满足，任何触发 `UpdatePlacement` 的
+  事件（包括仅仅是心跳/UI 饱和度文本刷新引发的 `LayoutUpdated`）都会引发一轮
+  互相插队，`SetWindowPos` 调用量随时间线性增长、永不收敛。**修复**：新增
+  `Host/OverlayZOrderCoordinator.cs`，按宿主根 HWND 分组维护一条确定性的
+  登记序链（`child₁` 钉宿主正上方，`child₂` 钉 `child₁` 正上方……），每个
+  overlay 不再直接把宿主当参照物，而是经 `GetPredecessor` 问协调者要"链里排在
+  我前面、且当前正显示着子窗口"的那个 overlay（链首时就是宿主本身，和没有协调者
+  之前完全一样）；tab 场景下不可见的 overlay 被跳过、链自动退化成长度 1，浮动
+  出去的 pane 落在另一个顶层根 HWND 的另一条链上，互不干扰。
+  **关键坑 2.1（隐藏的 `HwndWrapper` 消息窗口）**：链条方案上线后仍观察到平铺下
+  两个 overlay 在任意一次激活事件（比如点击子窗口把它激活、抢到系统 Z 序最前）
+  之后开始永不收敛地反复互相纠正。根因：每个 WPF 子进程启动时都会自带至少一个
+  Win32 层面完全不可见、纯内部用途的顶层"HwndWrapper"消息窗口（PresentationCore
+  自己创建的，和本框架挂的可见子窗口是同一进程下两个不同的顶层句柄），而
+  `GetWindow(x, GW_HWNDPREV)` 不看可见性——这个隐藏窗口如果恰好长期卡在"参照物
+  正上方"这个 Z 序位置（实测确有此现象），对应的 overlay 就会永远判定"Z 序不
+  对"、永远重新插一次，插入后紧邻的还是那个没被这次 `SetWindowPos` 移动的隐藏
+  窗口，于是每一轮触发都重新发一次调用，累计量线性增长。**修复**：`OverlayHost`
+  新增 `GetNearestVisibleAbove` helper，判断"参照物正上方是不是我自己"时先跳过
+  所有 `Win32.IsWindowVisible` 为假的顶层窗口，一直找到第一个可见的（或 0）为止
+  再比较——隐藏的内部窗口不该参与"可见层叠顺序"的判定。
 - **跨线程访问 WPF 对象**：`SessionManager.Register`/`Unregister`/`CloseSession`
   都可能在 gRPC 线程池线程（Kestrel）或 `Process.Exited`（ThreadPool）上被调用，
   而它们要碰的 `OverlayHost`（`Border`）、`IDockPane`（AvalonDock `LayoutDocument`）
@@ -267,21 +308,22 @@ Framework 一行代码；换一个 dock 库（比如 Infragistics `XamDockManage
 | 文件 | 职责 |
 |---|---|
 | `WpfMultiProcess.Framework.csproj` | `Library`, `net10.0-windows`, `UseWPF`；`FrameworkReference=Microsoft.AspNetCore.App`（Kestrel + Hosting/Logging Abstractions 都靠它，不需要额外 PackageReference）；只编译 `common.proto` |
-| `Protos/common.proto` | 公共契约：`CommonService`(Pong/RequestActivate/ReportUiStats，按 session_id 路由) + 共享消息(`RegisterReply`/`Ping`/`Shutdown`/`ShutdownReason`/`Ack`/`UiStatsRequest`) |
+| `Protos/common.proto` | 公共契约：`CommonService`(Pong/ReportUiStats，按 session_id 路由；`RequestActivate` 已随 Problem 1 修复整条删除) + 共享消息(`RegisterReply`/`Ping`/`Shutdown`/`ShutdownReason`/`Ack`/`UiStatsRequest`) |
 | `Ipc/GrpcUds.cs` | UDS 通道工厂（客户端 `ConnectCallback` + 套接字路径约定） |
-| `Ipc/Win32.cs` | GetWindow / GetWindowLongPtr / SetWindowLongPtr / SetWindowPos / ShowWindow P/Invoke |
+| `Ipc/Win32.cs` | GetWindow / GetWindowLongPtr / SetWindowLongPtr / SetWindowPos / ShowWindow / IsWindowVisible P/Invoke |
 | `Host/IDockPane.cs` | `IDockPane`：框架对"dock pane"的最小抽象，形状贴着 `XamDockManager.ContentPane` 设计，零依赖任何具体 dock 库；造 pane 是调库方 UI 代码自己的职责，框架只接收造好的 pane |
 | `Host/IFeatureHost.cs` | 调库方主进程侧接缝：`FeatureId`/`Descriptor`/`MapService(endpoints)` |
 | `Host/Session/Session.cs` | 非泛型抽象基类 `Session : IDisposable`：会话身份(`SessionId`/`FeatureId`/`FeatureIndex`/`Pid`/`Hwnd`)、`SendHeartbeat`/`SendClose`、`ServeAsync<T>`(接收 stream 所有权)、`OnConnected`/`OnPong`/`OnUiStats`/`OnDisconnected` 生命周期虚方法、`Dispose`/内部幂等门 `DisposeOnce` |
 | `Host/Session/SessionPump.cs` | 静态助手 `PumpAsync<T>`：把 `ChannelReader<T>` 里的 envelope 转发进 `IServerStreamWriter<T>`，多数 `Session.ServeAsync` 实现的样板 |
 | `Host/Session/SessionManager.cs` | 会话层核心：`OpenFeature(featureId, featureIndex, pane)`/`Register(session, pid, hwnd)`/`Unregister`/`CloseSession`/`CloseAll`、心跳泵(2s)/无响应检测(5000ms)、`ReplyOf`、`FindSession<TSession>`、跨线程 Dispatcher 调度 |
 | `Host/CommonServiceImpl.cs` | `CommonService` 实现（薄壳，按 session_id 转发给 SessionManager），构造注入 `ILogger<CommonServiceImpl>` |
-| `Host/OverlayHost.cs` | 占位控件：无 owner 关系，`SetWindowPos`(`SWP_ASYNCWINDOWPOS`)钉位置+手动 Z 序（feature 无关） |
+| `Host/OverlayHost.cs` | 占位控件：无 owner 关系，`SetWindowPos`(`SWP_ASYNCWINDOWPOS`)钉位置+手动 Z 序（feature 无关）；Z 序参照物经 `OverlayZOrderCoordinator.GetPredecessor` 取得，`GetNearestVisibleAbove` 跳过隐藏的 `HwndWrapper` 消息窗口再判定 |
+| `Host/OverlayZOrderCoordinator.cs` | 按宿主根 HWND 维护确定性登记序 Z 序链，修复平铺布局下多个可见 overlay 互抢"宿主正上方"位置、永不收敛的问题（feature 无关） |
 | `Child/ChildStartOptions.cs` | 子进程启动参数：featureId/featureIndex/sessionId/socketPath/hostPid |
 | `Child/ChildProgram.cs` | 子进程通用入口：`Run(IHost host, ChildStartOptions, IReadOnlyList<IFeatureChild>)`——孤儿自杀看护 + 从 `host.Services` 取 `ILoggerFactory`/`Application` + 拉起 `ChildWindow` + bootstrap(建 channel/`ChildShell` → `IFeatureChild.CreateViewModel`/`CreateView` → `Start()`) |
 | `Child/ChildContext.cs` | `{Channel, SessionId, FeatureIndex, Shell}` 只读结构体，传给 `IFeatureChild.CreateViewModel` |
-| `Child/ChildWindow.cs` | 无边框子窗口：`WS_EX_NOACTIVATE`\|`WS_EX_TOOLWINDOW`、初始位置屏幕外、`SourceReady`/`Closed` 接缝 |
-| `Child/ChildShell.cs` | 子进程框架状态条：持有 Hwnd、暴露 `Logger`、`ApplyReply`(标题/主题色)、`SendPong`/`RequestActivate`、`RequestClose`、拉起/停止 `UiSaturationMeter` |
+| `Child/ChildWindow.cs` | 无边框子窗口：仅 `WS_EX_TOOLWINDOW`（完全可激活，键盘输入需要）、初始位置屏幕外、`SourceReady`/`Closed` 接缝 |
+| `Child/ChildShell.cs` | 子进程框架状态条：持有 Hwnd、暴露 `Logger`、`ApplyReply`(标题/主题色)、`SendPong`、`RequestClose`、拉起/停止 `UiSaturationMeter`（`RequestActivate` 已随 Problem 1 修复删除） |
 | `Child/UiSaturationMeter.cs` | 框架级、feature-无关：后台线程探针积分 UI 线程饱和度(权威值) + `Dispatcher.Hooks` 归因，经 `CommonService.ReportUiStats` 上报 |
 | `Child/IFeatureChild.cs` | 调库方子进程侧接缝：`FeatureId`/`CreateViewModel(ChildContext)`/`CreateView(FeatureViewModel)` |
 | `Child/FeatureViewModel.cs` | `FeatureViewModel`(非泛型) + `FeatureViewModel<TDown>`：`RunAsync` 循环读 stream、`HandlePing`(回 Pong)/`HandleShutdown`(记诊断日志→关窗口)、`OnReply`(标题/主题色)、抽象 `Dispatch`/`OnData` |
@@ -295,7 +337,7 @@ Framework 一行代码；换一个 dock 库（比如 Infragistics `XamDockManage
 | `Protos/waveform.proto` | `WaveformService`：Register(StreamRequest → server stream, envelope = Reply⊕Ping⊕Shutdown⊕Frame) + GetStatistics unary |
 | `Protos/table.proto` | `TableService`：Register(StreamRequest → server stream, envelope = Reply⊕Ping⊕Shutdown⊕Delta) + Sort unary |
 | `Host/HostProgram.cs` | 主进程入口：造 `MainWindow`，起 Kestrel（`SessionManager` 经 DI 工厂注册，`AddDebug()` 日志），回调 `AttachSessionManager` |
-| `Host/MainWindow.cs` | AvalonDock 主窗口：dock pane 全动态创建，"新建波形/新建表格"按钮自己造 `LayoutDocument`+`AvalonDockPane`、维护每个 featureId 的下一个 featureIndex，调 `SessionManager.OpenFeature(id, index, pane)`；订阅 `SessionManager` 事件展示状态栏/事件日志，F9 float/dock 测试钩子 |
+| `Host/MainWindow.cs` | AvalonDock 主窗口：启动时自动打开 waveform/table 各一个实例、左右平铺（`LayoutPanel` 里两个 `LayoutDocumentPane`），"新建波形/新建表格"按钮自己造 `LayoutDocument`+`AvalonDockPane`、维护每个 featureId 的下一个 featureIndex，调 `SessionManager.OpenFeature(id, index, pane)`；订阅 `SessionManager` 事件展示状态栏/事件日志，F9 float/dock 测试钩子（用于验证 dock↔float 切换后 OverlayHost 正确换宿主） |
 | `Host/AvalonDockPane.cs` | `IDockPane` 的 AvalonDock 实现：包一个调用方已经建好并加进 `LayoutDocumentPane` 的 `LayoutDocument` |
 | `Host/Features/Waveform/WaveformFeature.cs`, `WaveformSession.cs`, `WaveformServiceImpl.cs` | 波形 feature：`IFeatureHost` 实现 + `Session` 子类(内部 `Channel<WaveformDown>` + 50ms 正弦帧 producer) + gRPC 服务实现(Register 里自己 `new` Session → `SessionManager.Register` 校验 → 写 Reply → `session.ServeAsync`，GetStatistics unary 经 `FindSession` 读快照) |
 | `Host/Features/Table/TableFeature.cs`, `TableSession.cs`, `TableServiceImpl.cs` | 表格 feature：同上模式，动态行(增删/变值) + Sort unary |
@@ -308,9 +350,32 @@ Framework 一行代码；换一个 dock 库（比如 Infragistics `XamDockManage
 Automation + Win32 API 对真实运行中的 demo 进程操作）：
 
 - 干净构建：`dotnet clean` + `dotnet build` 全项目 0 警告/0 错误。
-- 启动 + 自动打开：主进程启动后自动打开 waveform/table 各一个实例。
+- 启动 + 自动打开：主进程启动后自动打开 waveform/table 各一个实例，左右平铺
+  同时可见（回归 tab-only 场景不再是唯一布局，Z 序链协调者正是为了这个平铺场景）。
 - 多开：同一 feature 反复点击"新建波形/新建表格"能正确开出独立递增
   `featureIndex` 的新子进程，各自 overlay 到自己的 dock pane。
+- **键盘输入**（Problem 1）：子窗口去掉 `WS_EX_NOACTIVATE` 后可正常接收键盘焦点/
+  快捷键/Tab 导航；点击子窗口会使主窗口标题栏失活（无 owner 关系的固有代价，已
+  接受，不再用 `RequestActivate` 补偿）。
+- **平铺布局 Z 序收敛**（Problem 2）：静止状态下两个平铺 overlay 初次摆位后
+  `OverlayHost.SetWindowPosCallCount` 收敛到 2（各一次），此后长时间静置不再
+  增长。用 `SetForegroundWindow` 直接程序化激活（而非模拟鼠标点击——本环境下
+  模拟鼠标输入不可靠传递激活状态，见下方说明）在 A/B/宿主之间反复切换：
+  - **修复前**（仅链协调者，未修 `GetNearestVisibleAbove`）：任意一次激活后
+    两个 overlay 陷入永不收敛的互相纠正，8 轮激活 + 15s 静置后仍持续增长，累计
+    产生 66 次 `SetWindowPos`，且增长不停止。根因是 `GetWindow(x, GW_HWNDPREV)`
+    读到了 WPF 每个进程自带的、Win32 层面不可见的 `HwndWrapper` 消息窗口，被
+    它卡在"参照物正上方"的 Z 序位置上，导致判据永远为假。
+  - **修复后**（`GetNearestVisibleAbove` 跳过不可见窗口）：20 轮更高频的
+    强制激活切换（60ms 间隔）+ 30s 静置，`SetWindowPosCallCount` 相对修复前
+    的收敛基线**零增长**，验证彻底收敛。
+  - 测试环境备注：本环境下 `SetCursorPos`/`mouse_event` 模拟的鼠标点击未能
+    可靠地把系统前台激活状态转移到目标窗口（`GetForegroundWindow()` 观察到
+    停留在无关窗口上），验证改用 `Win32.SetForegroundWindow(hwnd)` 直接程序化
+    激活目标窗口，可靠复现/验证了上述行为。
+  - 三种布局场景（tab/平铺/浮动）均按 `OverlayZOrderCoordinator` 设计验证：
+    tab 下链退化成长度 1（行为与协调者引入前一致），平铺下链长等于当前可见
+    overlay 数，浮动出去的 pane 落在独立的顶层根 HWND 链上、互不干扰。
 - **卡死隔离**（`SWP_ASYNCWINDOWPOS` 的核心价值，验收线 500ms）：让一个子进程 UI
   线程 `Thread.Sleep` 卡死 10 秒，500ms 内对另一个未受影响的子进程窗口发起 UI
   Automation 调用，实测 83ms 内完成响应；同一时间窗口内其余子进程窗口的心跳
@@ -318,7 +383,9 @@ Automation + Win32 API 对真实运行中的 demo 进程操作）：
 - unary RPC：统计(`GetStatistics`)/排序(`Sort`) 按钮触发对应 feature 服务的 unary
   调用并正确回显结果。
 - pane 关闭 → 子进程退出：关闭某个 tab 只终止对应的那一个子进程（`ShutdownReason.
-  PaneClosed`），其余会话不受影响，进程数相应减少。
+  PaneClosed`），其余会话不受影响，进程数相应减少；用 UI Automation 通过
+  AvalonDock 文档标签上的 `DocumentCloseButton` 触发，确认子进程以 exit code 0
+  干净退出。
 - 20 次连续 tab 切换：实测每次切换 12~18ms，无可观察卡顿，4 个子进程全程存活。
 - 主窗口关闭 → 全部子进程自动退出（`ShutdownReason.HostClosing`），进程列表里
   不留任何孤儿 `WpfMultiProcess.Demo.exe`——间接验证了 `Session.Dispose` 在

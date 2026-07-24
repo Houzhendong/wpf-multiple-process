@@ -6,15 +6,17 @@ package ipc.common;
 
 // 会话建立本身已经并入各 feature 自己的 server-stream Register(见 waveform.proto /
 // table.proto 的 StreamRequest{session_id, hwnd, pid}),这里只剩下真正 feature-无关、
-// 且不方便挂在 stream 上的两个 unary:子进程 UI 线程回 Pong、子进程点击后请求主进程
-// 补偿激活。session_id 本身由主进程在拉起子进程前生成,当启动参数传入,不再靠一次
-// Register RPC 换取。
+// 且不方便挂在 stream 上的 unary:子进程 UI 线程回 Pong、上报 UI 线程饱和度。
+// session_id 本身由主进程在拉起子进程前生成,当启动参数传入,不再靠一次 Register RPC
+// 换取。
+//
+// 原来这里还有一个 RequestActivate(子窗口 WS_EX_NOACTIVATE 时点击不会自己抢激活,
+// 靠它上报"我被点了"换取主进程 Activate() 补偿)。子窗口改为全部可激活后(见
+// Framework 的 ChildWindow),点击会被系统正常处理,这条补偿链存在的理由消失,
+// 整条删掉,不再保留。
 service CommonService {
   // 子进程收到 Ping 后在 UI 线程回 Pong,证明 UI 线程存活。
   rpc Pong (PongRequest) returns (Ack);
-
-  // 子进程被点击(WS_EX_NOACTIVATE 拦掉了自然激活)时上报,换取主进程 Activate() 补偿。
-  rpc RequestActivate (ActivateRequest) returns (Ack);
 
   // 子进程 UiSaturationMeter 后台线程每窗口(约 1s)上报一次 UI 线程饱和度,
   // fire-and-forget,和 Pong 共用同一个 CommonServiceClient/Channel。
@@ -34,10 +36,6 @@ message PongRequest {
   int64 seq = 2;
   int64 ping_timestamp_ms = 3;  // 回显 Ping 的时间戳
   int64 pong_timestamp_ms = 4;  // 子进程 UI 线程处理时刻
-}
-
-message ActivateRequest {
-  string session_id = 1;
 }
 
 // UiSaturationMeter 每窗口上报一次:saturation_pct 是后台线程 Background 优先级探针
