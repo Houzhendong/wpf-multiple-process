@@ -36,11 +36,26 @@ public sealed class SessionManager : IDisposable
         public required int FeatureIndex { get; init; }
         public required OverlayHost Overlay { get; init; }
         public required IDockPane Pane { get; init; }
-        public required Process Process { get; init; }
+
+        /// <summary>不再是 required init:RestartSession 意外退出重试时要换成新拉起的进程,
+        /// 原来的 init-only 没法二次赋值。</summary>
+        public required Process Process { get; set; }
 
         /// <summary>OpenFeature 时还是 null(只是预登记),子进程 Register 校验通过后
-        /// 才落地——见 <see cref="SessionManager.Register"/>。</summary>
+        /// 才落地——见 <see cref="SessionManager.Register"/>。RestartSession 会把它清回 null
+        /// (Unregister 不会清,只是把 _connected/_lastPongMs 摘掉,详见 RestartSession 注释)。</summary>
         public Session? Session { get; set; }
+
+        /// <summary>Process.Exited 判定为"意外退出"(entry 还在 _entries 里,没人主动关过)时
+        /// 置位;RestartSession 成功后清空。<see cref="OpenFeature"/> 里同一 (featureId,
+        /// featureIndex) 的重复检查天然会因为 entry 仍在 _entries 里而拒绝,不需要额外读这个
+        /// 标志——它只是给 RestartSession 自己防重入用。</summary>
+        public bool IsFaulted { get; set; }
+
+        /// <summary>RestartSession(通常来自 UI 线程的重试按钮点击)和 Process.Exited 处理
+        /// (线程池)都会读写 Process/Session/IsFaulted 这几个字段,用一把简单的锁把两者串行化,
+        /// 避免"刚重启的新进程立刻又崩溃"这种极端时序下两条路径互相踩。</summary>
+        public Lock Gate { get; } = new();
     }
 
     private readonly SessionLaunchOptions _launch;
@@ -63,6 +78,11 @@ public sealed class SessionManager : IDisposable
     public event Action<string, string, int>? SessionConnected;     // sessionId, featureId, pid
     public event Action<string, string, nint>? WindowRegistered;    // sessionId, featureId, hwnd
     public event Action<string, string>? SessionDisconnected;       // sessionId, featureId(feature stream 断开)
+    /// <summary>sessionId, featureId, exitCode——子进程意外退出(Process.Exited 触发时 entry
+    /// 还在 _entries 里,说明没人主动关过)时触发,供宿主应用记日志/告警。此时 pane 没有关闭,
+    /// entry 也没有被移除,OverlayHost 已经换成了错误页,调库方可以用这个事件做额外的通知
+    /// (比如弹 toast),不需要自己重新判定"是不是意外退出"。</summary>
+    public event Action<string, string, int>? SessionFaulted;
     /// <summary>sessionId, featureId, pingSeq, 往返耗时 ms。</summary>
     public event Action<string, string, long, double>? PongReceived;
     /// <summary>sessionId, featureId, 已失联毫秒数。</summary>
@@ -119,12 +139,7 @@ public sealed class SessionManager : IDisposable
 
         pane.Closed += (_, _) => CloseSession(sessionId, ShutdownReason.PaneClosed);
 
-        entry.Process.EnableRaisingEvents = true;
-        entry.Process.Exited += (_, _) =>
-        {
-            FeatureLog?.Invoke($"{featureId}#{featureIndex}", $"子进程退出 (code {SafeExitCode(entry.Process)})");
-            CloseSession(sessionId);
-        };
+        WireProcessExited(sessionId, entry, entry.Process);
 
         _logger.LogInformation("OpenFeature: sessionId={SessionId} featureId={FeatureId} featureIndex={FeatureIndex} pid={Pid}",
             sessionId, featureId, featureIndex, entry.Process.Id);
@@ -148,6 +163,103 @@ public sealed class SessionManager : IDisposable
         psi.ArgumentList.Add($"--socket={_launch.SocketPath}");
         psi.ArgumentList.Add($"--hostpid={Environment.ProcessId}");
         return Process.Start(psi)!;
+    }
+
+    /// <summary>给一个子进程实例挂 Exited 回调,OpenFeature 首次拉起的进程和 RestartSession
+    /// 重新拉起的进程统一走这一个方法。回调里显式捕获这次挂钩的 <paramref name="process"/>
+    /// 实例本身,不读 entry.Process 的"当时"值——RestartSession 可能已经把 entry.Process
+    /// 换成更新的进程,旧进程如果晚一步才触发 Exited,靠这里捕获的值和 entry.Process 的
+    /// "当前"值做 ReferenceEquals 比较(见 <see cref="HandleChildExited"/>),才能分辨出这是
+    /// 不是一次过期事件,避免污染刚重启的新会话。</summary>
+    private void WireProcessExited(string sessionId, SessionEntry entry, Process process)
+    {
+        process.EnableRaisingEvents = true;
+        process.Exited += (_, _) => HandleChildExited(sessionId, entry, process);
+    }
+
+    /// <summary>
+    /// Process.Exited 统一走这里。先判断这次触发是不是来自 entry 当前的进程——不是就是
+    /// RestartSession 替换掉的旧进程的延迟事件,直接丢弃。再判断 entry 是否还在 _entries
+    /// 里:三条主动关闭路径(用户关 pane / CloseAll / 调库方调 CloseSession)都会先
+    /// TryRemove 掉 entry,之后 KillIfStillRunningAsync 兜底杀掉进程导致的 Exited 落到这里
+    /// 正好命中"已移除"分支,清理已经在 CloseSession 里做完了,什么都不用做。entry 还在,
+    /// 说明没人主动关过——这就是"意外退出"的判定信号,不需要额外的标志位:保留 entry/pane
+    /// (不调 CloseSession),标记 IsFaulted,把 OverlayHost 换成错误页 + 重试按钮,触发
+    /// SessionFaulted 供宿主记日志/告警。
+    /// </summary>
+    private void HandleChildExited(string sessionId, SessionEntry entry, Process exitedProcess)
+    {
+        lock (entry.Gate)
+        {
+            if (!ReferenceEquals(entry.Process, exitedProcess))
+                return; // 上一个已经被 RestartSession 替换掉的旧进程,延迟触发的 Exited,忽略
+
+            int exitCode = SafeExitCode(exitedProcess);
+            FeatureLog?.Invoke($"{entry.FeatureId}#{entry.FeatureIndex}", $"子进程退出 (code {exitCode})");
+
+            if (!_entries.TryGetValue(sessionId, out var current) || !ReferenceEquals(current, entry))
+                return; // entry 已经被 CloseSession 移除,这是主动关闭路径里 Kill 兜底触发的正常 Exited
+
+            entry.IsFaulted = true;
+            _logger.LogWarning(
+                "Unexpected child exit: sessionId={SessionId} featureId={FeatureId} featureIndex={FeatureIndex} exitCode={ExitCode}",
+                sessionId, entry.FeatureId, entry.FeatureIndex, exitCode);
+            SessionFaulted?.Invoke(sessionId, entry.FeatureId, exitCode);
+
+            var info = new OverlayFaultInfo(entry.FeatureId, entry.FeatureIndex, exitCode, () => RestartSession(sessionId));
+            // HandleChildExited 来自线程池(Process.Exited),ShowFault 碰的是 UI 线程独占的
+            // OverlayHost,和 AttachChild/DetachChild 一样必须调度回它自己的 Dispatcher。
+            entry.Overlay.Dispatcher.BeginInvoke(() => entry.Overlay.ShowFault(info));
+        }
+    }
+
+    /// <summary>
+    /// 错误页"重试"按钮的动作(经 <see cref="OverlayFaultInfo.Retry"/> 间接调用,通常来自
+    /// UI 线程的按钮点击,但不假设调用方线程)。复用同一个 sessionId/featureId/featureIndex/
+    /// pane,不新生成 session_id:
+    ///   1. 旧 <see cref="Session"/>(如果曾经连接成功过)还挂在 entry 上,<see cref="Register"/>
+    ///      有"entry.Session 非 null 就拒绝重复注册"的检查,必须显式清掉,否则新子进程带着
+    ///      同一个 session_id 连上来会被拒绝。这里的摘除/DisposeOnce 都是幂等操作——如果
+    ///      <see cref="Unregister"/>(stream 断开路径)已经跑过一遍,重复做没有副作用;真正
+    ///      必须在这里做、Unregister 不会做的是 entry.Session = null,Unregister 不碰
+    ///      _entries,不清这个字段的话会一直挡住 Register 的重复注册检查。
+    ///   2. OverlayHost 打回中性的等待占位(新子进程真正连上来之前那段真空期,不能让上一次
+    ///      崩溃的错误页继续挂着)。
+    ///   3. 拉起一个新子进程,换掉 entry.Process,重新挂 Exited 处理器——旧进程如果晚一步才
+    ///      触发 Exited,靠 <see cref="HandleChildExited"/> 里的 ReferenceEquals 判断挡掉,
+    ///      不会污染这次重启。
+    /// entry.Gate 保证这整套清理和 HandleChildExited 标记 IsFaulted 不会互相踩(比如刚重启的
+    /// 新进程立刻又崩溃这种极端时序)。
+    /// </summary>
+    public void RestartSession(string sessionId)
+    {
+        if (!_entries.TryGetValue(sessionId, out var entry)) return; // 用户没点重试就先关了 pane,entry 已经被彻底清理,无事可做
+
+        lock (entry.Gate)
+        {
+            if (!entry.IsFaulted) return; // 不是故障态(比如错误页按钮被连点两次),避免重复重启一个还活着/已经在重启中的会话
+
+            if (entry.Session is { } oldSession)
+            {
+                _connected.TryRemove(sessionId, out _);
+                _lastPongMs.TryRemove(sessionId, out _);
+                lock (_unresponsiveLock) _unresponsive.Remove(sessionId);
+                oldSession.DisposeOnce();
+                entry.Session = null;
+            }
+
+            entry.IsFaulted = false;
+            entry.Overlay.Dispatcher.BeginInvoke(() => entry.Overlay.ResetToWaiting());
+
+            var newProcess = StartChildProcess(entry.FeatureId, sessionId, entry.FeatureIndex);
+            entry.Process = newProcess;
+            WireProcessExited(sessionId, entry, newProcess);
+
+            _logger.LogInformation(
+                "RestartSession: sessionId={SessionId} featureId={FeatureId} featureIndex={FeatureIndex} newPid={Pid}",
+                sessionId, entry.FeatureId, entry.FeatureIndex, newProcess.Id);
+            FeatureLog?.Invoke($"{entry.FeatureId}#{entry.FeatureIndex}", $"重试:已启动新子进程 pid {newProcess.Id}");
+        }
     }
 
     /// <summary>关闭一个会话:推 Shutdown(带上触发源 reason,子进程可能还没连上来,

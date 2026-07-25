@@ -57,6 +57,15 @@ public sealed class OverlayHost : Border
     private nint _ownerHwnd;
     private HwndSource? _ownerSource;
 
+    /// <summary>"等待子进程窗口接入…" 占位内容,构造时造好存成字段——AttachChild 成功接上
+    /// 子窗口、以及 RestartSession 重新拉起子进程之前,都要把 Child 打回这个中性状态(可能是
+    /// 从过期的错误页切回来),不能每次都 new 一个新的 TextBlock。</summary>
+    private readonly TextBlock _waitingContent;
+
+    /// <summary>非 null 时,子进程意外退出后的错误页用调库方这里给的自定义内容;否则
+    /// <see cref="ShowFault"/> 用框架内置的默认错误页(标题+明细+提示+重试按钮)。</summary>
+    public Func<OverlayFaultInfo, FrameworkElement>? FaultContentFactory { get; set; }
+
     // 脏检查:记录上一次实际发给 SetWindowPos 的状态。tab 切换期间 AvalonDock
     // 一次切换会连续触发几十次 LayoutUpdated,而其中绝大多数并未改变本控件
     // 的屏幕矩形/可见性/Z 序,如果照样每次都发 SetWindowPos,大量重复/过时的
@@ -81,13 +90,14 @@ public sealed class OverlayHost : Border
     public OverlayHost()
     {
         Background = new SolidColorBrush(Color.FromRgb(0x1E, 0x1E, 0x1E));
-        Child = new TextBlock
+        _waitingContent = new TextBlock
         {
             Text = "等待子进程窗口接入…",
             Foreground = Brushes.Gray,
             HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Center,
         };
+        Child = _waitingContent;
 
         Loaded += (_, _) => HookOwner();
         Unloaded += (_, _) => ScheduleUpdate();    // 被拖出/隐藏时先藏起子窗口
@@ -117,6 +127,10 @@ public sealed class OverlayHost : Border
     public void AttachChild(nint childHwnd)
     {
         _childHwnd = childHwnd;
+        // 重试成功接上新子窗口后,占位内容要从过期的错误页(或残留的等待态)回到中性的
+        // 等待态——虽然会被子窗口盖住看不见,但这个会话之后再断开时会重新露出来,不能让
+        // 上一次崩溃的错误页停留在那里。
+        Child = _waitingContent;
         ForceNextUpdate();
         HookOwner();
         // HookOwner() 只在宿主发生变化时才会重新钉 Z 序;首次挂载时宿主可能
@@ -131,6 +145,77 @@ public sealed class OverlayHost : Border
             HideChildAsync(_childHwnd);
         _childHwnd = 0;
         ForceNextUpdate();
+    }
+
+    /// <summary>子进程意外退出时(SessionManager 判定,见 SessionManager.HandleChildExited)
+    /// 展示错误页 + 重试按钮,取代空白占位。经 Dispatcher.BeginInvoke 调用(触发源是线程池上的
+    /// Process.Exited)。</summary>
+    internal void ShowFault(OverlayFaultInfo info) =>
+        Child = FaultContentFactory?.Invoke(info) ?? BuildDefaultFaultContent(info);
+
+    /// <summary>RestartSession 重新拉起子进程之前调用,把占位内容从(可能过期的)错误页
+    /// 打回中性等待态——新子进程真正连上来之前这段真空期,不能让错误页一直挂着。</summary>
+    internal void ResetToWaiting() => Child = _waitingContent;
+
+    /// <summary>框架内置的默认错误页:标题(红色加粗)+ 明细行(featureId/index/退出码,
+    /// 十六进制形式方便对照常见的崩溃码如 0xC0000005)+ 灰色提示 + 重试按钮。</summary>
+    private static FrameworkElement BuildDefaultFaultContent(OverlayFaultInfo info)
+    {
+        var stack = new StackPanel
+        {
+            Orientation = Orientation.Vertical,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            MaxWidth = 360,
+        };
+
+        stack.Children.Add(new TextBlock
+        {
+            Text = "子进程意外退出",
+            Foreground = new SolidColorBrush(Color.FromRgb(0xE5, 0x51, 0x51)),
+            FontWeight = FontWeights.Bold,
+            FontSize = 16,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(0, 0, 0, 8),
+        });
+
+        stack.Children.Add(new TextBlock
+        {
+            Text = $"{info.FeatureId} #{info.FeatureIndex}    exit code {info.ExitCode} (0x{info.ExitCode:X8})",
+            Foreground = Brushes.White,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            TextWrapping = TextWrapping.Wrap,
+            TextAlignment = TextAlignment.Center,
+            Margin = new Thickness(0, 0, 0, 8),
+        });
+
+        stack.Children.Add(new TextBlock
+        {
+            Text = "窗格保持打开,可以重试;关闭窗格会彻底结束这个实例。",
+            Foreground = Brushes.Gray,
+            FontSize = 11,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            TextWrapping = TextWrapping.Wrap,
+            TextAlignment = TextAlignment.Center,
+            Margin = new Thickness(0, 0, 0, 12),
+        });
+
+        var retryButton = new Button
+        {
+            Content = "重试",
+            Padding = new Thickness(16, 4, 16, 4),
+            HorizontalAlignment = HorizontalAlignment.Center,
+        };
+        // 防连点:点一下立刻禁用,RestartSession 成功后 AttachChild 会把 Child 整个换掉
+        // (新子窗口盖住这块区域),这个按钮本身不需要、也没机会被重新启用。
+        retryButton.Click += (_, _) =>
+        {
+            retryButton.IsEnabled = false;
+            info.Retry();
+        };
+        stack.Children.Add(retryButton);
+
+        return stack;
     }
 
     /// <summary>
@@ -322,3 +407,8 @@ public sealed class OverlayHost : Border
         return false;
     }
 }
+
+/// <summary>意外退出错误页需要的展示数据 + 重试动作。<see cref="Retry"/> 是框架给的动作
+/// (内部就是 SessionManager.RestartSession(sessionId)),这样自定义 <see cref="OverlayHost.FaultContentFactory"/>
+/// 不需要知道 SessionManager/sessionId 的存在,拿到这个 record 就能拼错误 UI、挂重试按钮。</summary>
+public sealed record OverlayFaultInfo(string FeatureId, int FeatureIndex, int ExitCode, Action Retry);

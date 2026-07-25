@@ -232,6 +232,13 @@ public sealed class MainWindow : Window
         sessionManager.SessionDisconnected += (sessionId, featureId) =>
             Dispatcher.BeginInvoke(() => Log($"[{SessionTag(sessionId, featureId)}] 会话断开"));
 
+        // 子进程意外退出:pane 不关闭,SessionManager 已经把 OverlayHost 换成默认错误页
+        // (标题+明细+重试按钮),这里只往事件日志记一行,不需要额外处理——默认错误页
+        // 就是要展示给用户看的东西,demo 不自定义 FaultContentFactory。
+        sessionManager.SessionFaulted += (sessionId, featureId, exitCode) =>
+            Dispatcher.BeginInvoke(() => Log(
+                $"[{SessionTag(sessionId, featureId)}] ⚠ 子进程意外退出 (exit code {exitCode} / 0x{exitCode:X8}),窗格保留,可点击\"重试\""));
+
         sessionManager.WindowRegistered += (sessionId, featureId, hwnd) =>
             Dispatcher.BeginInvoke(() => Log($"[{SessionTag(sessionId, featureId)}] 收到 HWND 0x{hwnd:X},执行 overlay"));
 

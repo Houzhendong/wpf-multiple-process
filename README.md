@@ -293,6 +293,32 @@ Framework 一行代码；换一个 dock 库（比如 Infragistics `XamDockManage
     `Replaced`（预留：同 session 重复连接被顶掉）/`HostError`（主进程内部错误）/
     `Restarting`（预留：重启/升级）——子进程侧收到后行为一致（关窗口），
     `reason`/`detail` 只用于日志/可观测性区分"我是被谁关掉的"。
+- **子进程意外退出的处理**：`CloseSession`/`Unregister`/用户点 pane 关闭这三条
+  "主动关闭"路径都会先把 entry 从 `SessionManager._entries` 里 `TryRemove` 掉，再去
+  `Kill`/等子进程退出——所以 `Process.Exited` 触发时 entry 是否还在 `_entries`
+  里，天然就是"这是主动关闭收尾的 Exited"还是"子进程自己异常退出"的判据，不需要
+  额外加标志位。异常退出时**不**调用 `CloseSession`、不移除 entry、不关 pane——
+  entry 上打一个 `IsFaulted` 标记（`OpenFeature` 校验 `(featureId, featureIndex)`
+  重复时会看这个标记，faulted 状态下继续拒绝重复打开），`OverlayHost` 换成框架
+  内置的默认错误页（标题"子进程意外退出"+ `{featureId} #{featureIndex} exit code`
+  明细 + 提示 pane 保持打开可重试 + "重试"按钮），同时抛出
+  `SessionManager.SessionFaulted(sessionId, featureId, exitCode)` 事件供宿主应用
+  记日志/告警。点"重试"调用框架提供的 `Retry` 回调（内部就是
+  `SessionManager.RestartSession(sessionId)`），复用同一个 `session_id`/
+  `featureIndex`/pane，不新开一个会话：先清掉旧 `Session`（从
+  `_connected`/`_lastPongMs`/`_unresponsive` 里摘掉、`DisposeOnce()`、显式把
+  `entry.Session` 设回 `null`——因为 `Register` 一旦看到 `entry.Session` 非空就会
+  拒绝新连接,而 `Unregister` 并不清这个字段),再重置 `IsFaulted`、`OverlayHost`
+  换回"等待接入"占位、用同样的 `featureId`/`session_id`/`featureIndex` 重新拉起一个
+  子进程替换 `entry.Process`。新旧两个 `Process` 的 `Exited` 事件用同一个 handler
+  处理,靠 `ReferenceEquals(entry.Process, exitedProcess)` 判断这次触发的是不是
+  entry 当前持有的那个进程,避免重启后旧进程延迟触发的 `Exited` 把刚重启好的会话
+  又错误地标记成 faulted;整段用每个 entry 自带的一把锁串行化,防止 `RestartSession`
+  (UI 线程)和 `Process.Exited`(线程池线程)并发踩踏同一个 entry。错误页本身也是
+  可替换的——`OverlayHost.FaultContentFactory` 非空时优先用调库方自己给的内容,
+  框架默认页只是兜底,自定义内容同样拿到一个 `OverlayFaultInfo{FeatureId,
+  FeatureIndex, ExitCode, Retry}`,不需要知道 `SessionManager`/`session_id` 这些
+  框架内部细节。
 - **DPI**：主/子进程同一 manifest（PerMonitorV2），`PointToScreen` 直接给出物理
   像素，跨显示器坐标一致。
 
@@ -310,9 +336,9 @@ Framework 一行代码；换一个 dock 库（比如 Infragistics `XamDockManage
 | `Host/IFeatureHost.cs` | 调库方主进程侧接缝：`FeatureId`/`Descriptor`/`MapService(endpoints)` |
 | `Host/Session/Session.cs` | 非泛型抽象基类 `Session : IDisposable`：会话身份(`SessionId`/`FeatureId`/`FeatureIndex`/`Pid`/`Hwnd`)、`SendHeartbeat`/`SendClose`、`ServeAsync<T>`(接收 stream 所有权)、`OnConnected`/`OnPong`/`OnUiStats`/`OnDisconnected` 生命周期虚方法、`Dispose`/内部幂等门 `DisposeOnce` |
 | `Host/Session/SessionPump.cs` | 静态助手 `PumpAsync<T>`：把 `ChannelReader<T>` 里的 envelope 转发进 `IServerStreamWriter<T>`，多数 `Session.ServeAsync` 实现的样板 |
-| `Host/Session/SessionManager.cs` | 会话层核心：`OpenFeature(featureId, featureIndex, pane)`/`Register(session, pid, hwnd)`/`Unregister`/`CloseSession`/`CloseAll`、心跳泵(2s)/无响应检测(5000ms)、`ReplyOf`、`FindSession<TSession>`、跨线程 Dispatcher 调度 |
+| `Host/Session/SessionManager.cs` | 会话层核心：`OpenFeature(featureId, featureIndex, pane)`/`Register(session, pid, hwnd)`/`Unregister`/`CloseSession`/`CloseAll`、心跳泵(2s)/无响应检测(5000ms)、`ReplyOf`、`FindSession<TSession>`、跨线程 Dispatcher 调度；子进程意外退出时打 `IsFaulted`、`OverlayHost.ShowFault`、抛 `SessionFaulted` 事件；`RestartSession(sessionId)` 复用同一 session_id 原地重启子进程 |
 | `Host/CommonServiceImpl.cs` | `CommonService` 实现（薄壳，按 session_id 转发给 SessionManager），构造注入 `ILogger<CommonServiceImpl>` |
-| `Host/OverlayHost.cs` | 占位控件：无 owner 关系，`SetWindowPos`(`SWP_ASYNCWINDOWPOS`)钉位置+手动 Z 序（feature 无关）；Z 序判据是 `IsChildAboveOwner`（沿宿主 `GW_HWNDPREV` 带步数上限向上找自己），插入锚点取 `GetNearestVisibleAbove(宿主)` |
+| `Host/OverlayHost.cs` | 占位控件：无 owner 关系，`SetWindowPos`(`SWP_ASYNCWINDOWPOS`)钉位置+手动 Z 序（feature 无关）；Z 序判据是 `IsChildAboveOwner`（沿宿主 `GW_HWNDPREV` 带步数上限向上找自己），插入锚点取 `GetNearestVisibleAbove(宿主)`；三态占位（等待接入/已接入子窗口/崩溃错误页），错误页内容可经 `FaultContentFactory` 自定义，否则用内置默认页 |
 | `Child/ChildStartOptions.cs` | 子进程启动参数：featureId/featureIndex/sessionId/socketPath/hostPid |
 | `Child/ChildProgram.cs` | 子进程通用入口：`Run(IHost host, ChildStartOptions, IReadOnlyList<IFeatureChild>)`——孤儿自杀看护 + 从 `host.Services` 取 `ILoggerFactory`/`Application` + 拉起 `ChildWindow` + bootstrap(建 channel/`ChildShell` → `IFeatureChild.CreateViewModel`/`CreateView` → `Start()`) |
 | `Child/ChildContext.cs` | `{Channel, SessionId, FeatureIndex, Shell}` 只读结构体，传给 `IFeatureChild.CreateViewModel` |
@@ -380,3 +406,11 @@ Automation + Win32 API 对真实运行中的 demo 进程操作）：
   `CloseSession`/`Process.Exited`/stream `finally` 并发路径下确实只被调用一次
   （`DisposeOnce` 幂等门），否则大概率会在这个多会话同时收尾的场景下表现为异常/
   挂起/僵尸进程。
+- 子进程意外退出 → 错误页 → 重试：`Stop-Process -Force` 直接杀掉某个子进程
+  模拟崩溃，实测该 pane 不关闭、换成默认错误页（标题/`{featureId} #{featureIndex}
+  exit code`明细/重试按钮），主窗口事件日志同步收到 `SessionFaulted`，同一宿主
+  下的另一个 feature 完全不受影响（心跳/渲染正常）；点"重试"能成功拉起新子进程
+  并让原 pane 重新渲染出 feature 内容（心跳/unary 调用恢复正常）；连续崩溃→重试
+  两轮均未复现残留问题；崩溃后不点重试直接关闭 pane，entry 清理干净、无异常，
+  同 featureId 可以再次新开实例；上述验证期间 Z 序纠正逻辑及正常关闭路径（pane
+  关闭/主窗口关闭）均未受影响。
