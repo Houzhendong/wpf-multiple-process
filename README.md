@@ -245,34 +245,29 @@ Framework 一行代码；换一个 dock 库（比如 Infragistics `XamDockManage
   `WM_WINDOWPOSCHANGED` 都改成 `Dispatcher.BeginInvoke` 去抖合并成一次；被切走
   隐藏的子窗口也暂停重绘。
 
-  **关键坑 2（平铺布局下的 Z 序互抢，`OverlayZOrderCoordinator`）**：早期实现里
-  每个 `OverlayHost` 都独立地把"宿主"当作唯一的 Z 序参照物（判据是"宿主正上方
-  紧邻的是不是我自己"）。tab 场景下同一时刻只有一个 overlay 可见，这条假设永远
-  成立；但平铺布局（同一宿主同时有多个可见 overlay，比如左右分栏同时显示
-  waveform+table）下，两个 overlay 会同时抢着"贴宿主正上方"这唯一的位置：A 先钉
-  完变成 `[A, host]`，B 检查发现"宿主正上方是 A 不是我"于是插进去变成
+  **关键坑 2（平铺布局下的 Z 序互抢，以及判据该怎么写）**：早期实现的判据是
+  "宿主正上方紧邻的必须是我自己"。tab 场景下同一时刻只有一个 overlay 可见，这条
+  假设永远成立；但平铺布局（同一宿主同时有多个可见 overlay，比如左右分栏同时
+  显示 waveform+table）下，两个 overlay 会同时抢着"贴宿主正上方"这唯一的位置：
+  A 先钉完变成 `[A, host]`，B 检查发现"宿主正上方是 A 不是我"于是插进去变成
   `[A, B, host]`，这时 A 再检查"宿主正上方现在是 B 不是我"又把自己插回去变成
   `[B, A, host]`——两边的判据永远不可能同时满足，任何触发 `UpdatePlacement` 的
   事件（包括仅仅是心跳/UI 饱和度文本刷新引发的 `LayoutUpdated`）都会引发一轮
-  互相插队，`SetWindowPos` 调用量随时间线性增长、永不收敛。**修复**：新增
-  `Host/OverlayZOrderCoordinator.cs`，按宿主根 HWND 分组维护一条确定性的
-  登记序链（`child₁` 钉宿主正上方，`child₂` 钉 `child₁` 正上方……），每个
-  overlay 不再直接把宿主当参照物，而是经 `GetPredecessor` 问协调者要"链里排在
-  我前面、且当前正显示着子窗口"的那个 overlay（链首时就是宿主本身，和没有协调者
-  之前完全一样）；tab 场景下不可见的 overlay 被跳过、链自动退化成长度 1，浮动
-  出去的 pane 落在另一个顶层根 HWND 的另一条链上，互不干扰。
-  **关键坑 2.1（隐藏的 `HwndWrapper` 消息窗口）**：链条方案上线后仍观察到平铺下
-  两个 overlay 在任意一次激活事件（比如点击子窗口把它激活、抢到系统 Z 序最前）
-  之后开始永不收敛地反复互相纠正。根因：每个 WPF 子进程启动时都会自带至少一个
-  Win32 层面完全不可见、纯内部用途的顶层"HwndWrapper"消息窗口（PresentationCore
-  自己创建的，和本框架挂的可见子窗口是同一进程下两个不同的顶层句柄），而
-  `GetWindow(x, GW_HWNDPREV)` 不看可见性——这个隐藏窗口如果恰好长期卡在"参照物
-  正上方"这个 Z 序位置（实测确有此现象），对应的 overlay 就会永远判定"Z 序不
-  对"、永远重新插一次，插入后紧邻的还是那个没被这次 `SetWindowPos` 移动的隐藏
-  窗口，于是每一轮触发都重新发一次调用，累计量线性增长。**修复**：`OverlayHost`
-  新增 `GetNearestVisibleAbove` helper，判断"参照物正上方是不是我自己"时先跳过
-  所有 `Win32.IsWindowVisible` 为假的顶层窗口，一直找到第一个可见的（或 0）为止
-  再比较——隐藏的内部窗口不该参与"可见层叠顺序"的判定。
+  互相插队，`SetWindowPos` 调用量随时间线性增长、永不收敛。
+  **修复**：把判据从"我紧贴宿主正上方"放宽成 **"我在宿主之上"**
+  （`OverlayHost.IsChildAboveOwner`：沿宿主的 `GW_HWNDPREV` 向上走，带步数上限，
+  碰到自己的子窗口句柄即为真；走到尽头或超限都视为"不在上方"、触发一次纠正，
+  纠正本身幂等）。平铺的几个子窗口互不重叠，它们彼此之间谁上谁下没有任何视觉
+  意义，只要都盖在宿主上方就是对的——判据放宽之后多个 overlay 可以同时满足，
+  矛盾消失，churn 随之消失。
+  这里走过一段弯路：曾经为此引入过一个"按宿主根 HWND 分组、给同宿主下的 overlay
+  排一条确定性登记序 Z 序链"的协调者（`OverlayZOrderCoordinator`），让每个 overlay
+  盯着链里排在自己前面的那个而不是宿主。它确实能消除互抢，但本质上是在用一个
+  额外的全局数据结构去回避"判据自相矛盾"这个真正的病根；判据放宽之后它就完全没有
+  存在意义了，已删除。同期还踩到过一个相关的坑：每个 WPF 子进程都自带若干
+  Win32 层面完全不可见的顶层 `HwndWrapper` 消息窗口，而 `GetWindow(GW_HWNDPREV)`
+  不看可见性，"紧贴"类判据会被这些隐藏窗口卡住而永远不成立——放宽后的判据只关心
+  "能不能在宿主上方找到自己"，天然不受隐藏窗口影响。
 - **跨线程访问 WPF 对象**：`SessionManager.Register`/`Unregister`/`CloseSession`
   都可能在 gRPC 线程池线程（Kestrel）或 `Process.Exited`（ThreadPool）上被调用，
   而它们要碰的 `OverlayHost`（`Border`）、`IDockPane`（AvalonDock `LayoutDocument`）
@@ -317,8 +312,7 @@ Framework 一行代码；换一个 dock 库（比如 Infragistics `XamDockManage
 | `Host/Session/SessionPump.cs` | 静态助手 `PumpAsync<T>`：把 `ChannelReader<T>` 里的 envelope 转发进 `IServerStreamWriter<T>`，多数 `Session.ServeAsync` 实现的样板 |
 | `Host/Session/SessionManager.cs` | 会话层核心：`OpenFeature(featureId, featureIndex, pane)`/`Register(session, pid, hwnd)`/`Unregister`/`CloseSession`/`CloseAll`、心跳泵(2s)/无响应检测(5000ms)、`ReplyOf`、`FindSession<TSession>`、跨线程 Dispatcher 调度 |
 | `Host/CommonServiceImpl.cs` | `CommonService` 实现（薄壳，按 session_id 转发给 SessionManager），构造注入 `ILogger<CommonServiceImpl>` |
-| `Host/OverlayHost.cs` | 占位控件：无 owner 关系，`SetWindowPos`(`SWP_ASYNCWINDOWPOS`)钉位置+手动 Z 序（feature 无关）；Z 序参照物经 `OverlayZOrderCoordinator.GetPredecessor` 取得，`GetNearestVisibleAbove` 跳过隐藏的 `HwndWrapper` 消息窗口再判定 |
-| `Host/OverlayZOrderCoordinator.cs` | 按宿主根 HWND 维护确定性登记序 Z 序链，修复平铺布局下多个可见 overlay 互抢"宿主正上方"位置、永不收敛的问题（feature 无关） |
+| `Host/OverlayHost.cs` | 占位控件：无 owner 关系，`SetWindowPos`(`SWP_ASYNCWINDOWPOS`)钉位置+手动 Z 序（feature 无关）；Z 序判据是 `IsChildAboveOwner`（沿宿主 `GW_HWNDPREV` 带步数上限向上找自己），插入锚点取 `GetNearestVisibleAbove(宿主)` |
 | `Child/ChildStartOptions.cs` | 子进程启动参数：featureId/featureIndex/sessionId/socketPath/hostPid |
 | `Child/ChildProgram.cs` | 子进程通用入口：`Run(IHost host, ChildStartOptions, IReadOnlyList<IFeatureChild>)`——孤儿自杀看护 + 从 `host.Services` 取 `ILoggerFactory`/`Application` + 拉起 `ChildWindow` + bootstrap(建 channel/`ChildShell` → `IFeatureChild.CreateViewModel`/`CreateView` → `Start()`) |
 | `Child/ChildContext.cs` | `{Channel, SessionId, FeatureIndex, Shell}` 只读结构体，传给 `IFeatureChild.CreateViewModel` |
@@ -351,31 +345,25 @@ Automation + Win32 API 对真实运行中的 demo 进程操作）：
 
 - 干净构建：`dotnet clean` + `dotnet build` 全项目 0 警告/0 错误。
 - 启动 + 自动打开：主进程启动后自动打开 waveform/table 各一个实例，左右平铺
-  同时可见（回归 tab-only 场景不再是唯一布局，Z 序链协调者正是为了这个平铺场景）。
+  同时可见（tab-only 不再是唯一布局，平铺正是 Z 序互抢问题暴露出来的场景）。
 - 多开：同一 feature 反复点击"新建波形/新建表格"能正确开出独立递增
   `featureIndex` 的新子进程，各自 overlay 到自己的 dock pane。
 - **键盘输入**（Problem 1）：子窗口去掉 `WS_EX_NOACTIVATE` 后可正常接收键盘焦点/
   快捷键/Tab 导航；点击子窗口会使主窗口标题栏失活（无 owner 关系的固有代价，已
   接受，不再用 `RequestActivate` 补偿）。
-- **平铺布局 Z 序收敛**（Problem 2）：静止状态下两个平铺 overlay 初次摆位后
-  `OverlayHost.SetWindowPosCallCount` 收敛到 2（各一次），此后长时间静置不再
-  增长。用 `SetForegroundWindow` 直接程序化激活（而非模拟鼠标点击——本环境下
-  模拟鼠标输入不可靠传递激活状态，见下方说明）在 A/B/宿主之间反复切换：
-  - **修复前**（仅链协调者，未修 `GetNearestVisibleAbove`）：任意一次激活后
-    两个 overlay 陷入永不收敛的互相纠正，8 轮激活 + 15s 静置后仍持续增长，累计
-    产生 66 次 `SetWindowPos`，且增长不停止。根因是 `GetWindow(x, GW_HWNDPREV)`
-    读到了 WPF 每个进程自带的、Win32 层面不可见的 `HwndWrapper` 消息窗口，被
-    它卡在"参照物正上方"的 Z 序位置上，导致判据永远为假。
-  - **修复后**（`GetNearestVisibleAbove` 跳过不可见窗口）：20 轮更高频的
-    强制激活切换（60ms 间隔）+ 30s 静置，`SetWindowPosCallCount` 相对修复前
-    的收敛基线**零增长**，验证彻底收敛。
+- **平铺布局 Z 序收敛**（Problem 2）：判据放宽成"我在宿主之上"
+  （`IsChildAboveOwner`）之后，平铺的两个 overlay 不再互抢——实际操作（点击子
+  窗口打字、点另一个子窗口、点回主窗口）下两个子窗口都稳定盖在宿主上方，
+  静止状态下 `OverlayHost.SetWindowPosCallCount` 不再持续增长。
+  在此之前用"紧贴宿主正上方"作判据时，任意一次激活都会让两个 overlay 陷入
+  永不收敛的互相纠正（实测 8 轮激活 + 15s 静置后累计 66 次 `SetWindowPos`
+  且仍在增长）；那一版还额外受 WPF 自带的不可见 `HwndWrapper` 消息窗口干扰
+  （`GetWindow(GW_HWNDPREV)` 不看可见性，判据被它卡住而永远为假），需要
+  `GetNearestVisibleAbove` 专门跳过——放宽后的判据不再有这两个问题。
   - 测试环境备注：本环境下 `SetCursorPos`/`mouse_event` 模拟的鼠标点击未能
     可靠地把系统前台激活状态转移到目标窗口（`GetForegroundWindow()` 观察到
-    停留在无关窗口上），验证改用 `Win32.SetForegroundWindow(hwnd)` 直接程序化
-    激活目标窗口，可靠复现/验证了上述行为。
-  - 三种布局场景（tab/平铺/浮动）均按 `OverlayZOrderCoordinator` 设计验证：
-    tab 下链退化成长度 1（行为与协调者引入前一致），平铺下链长等于当前可见
-    overlay 数，浮动出去的 pane 落在独立的顶层根 HWND 链上、互不干扰。
+    停留在无关窗口上），自动化验证时改用 `Win32.SetForegroundWindow(hwnd)`
+    直接程序化激活；最终判据放宽的效果由真实手动操作确认。
 - **卡死隔离**（`SWP_ASYNCWINDOWPOS` 的核心价值，验收线 500ms）：让一个子进程 UI
   线程 `Thread.Sleep` 卡死 10 秒，500ms 内对另一个未受影响的子进程窗口发起 UI
   Automation 调用，实测 83ms 内完成响应；同一时间窗口内其余子进程窗口的心跳

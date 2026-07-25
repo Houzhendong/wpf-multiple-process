@@ -1,4 +1,4 @@
-using System.Windows;
+﻿using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Interop;
 using System.Windows.Media;
@@ -9,8 +9,7 @@ namespace WpfMultiProcess.Host;
 
 /// <summary>
 /// dock pane 里的空白占位控件。子进程窗口注册后,持续把它 overlay(SetWindowPos)
-/// 在本控件的屏幕矩形上,并手动把它的 Z 序钉在"链条里排在它前面那个 overlay(或
-/// 链首时的宿主顶层窗口)"正上方——见 <see cref="OverlayZOrderCoordinator"/>。
+/// 在本控件的屏幕矩形上,并手动把它的 Z 序维持在宿主顶层窗口之上。
 ///
 /// 不使用 owner 关系(SetWindowLongPtr(GWLP_HWNDPARENT))或 SetParent:
 /// 跨进程建立 owner/parent 关系会让 Windows 隐式合并两个线程的输入队列
@@ -24,16 +23,15 @@ namespace WpfMultiProcess.Host;
 /// 由本类的去抖 + 宿主 WM_WINDOWPOSCHANGED 钩子在下一轮触发时重新纠正回来,
 /// 不需要额外处理。
 ///
-/// 问题 2 修复(平铺布局下多 overlay 互抢 Z 序):早期实现里每个 OverlayHost 都
-/// 独立地把"宿主"当作唯一参照物("宿主正上方紧邻的是不是我自己"),tab 场景下
-/// 同一时刻只有一个 overlay 可见,这条假设永远成立;但平铺布局(同一宿主同时有
-/// 多个可见 overlay,比如左右分栏)下,多个 overlay 会同时抢着"贴宿主正上方"这
-/// 唯一的位置,互相插队、永不收敛(详见 OverlayZOrderCoordinator 类注释)。修复
-/// 后每个 OverlayHost 不再直接用 <c>_ownerHwnd</c> 当 Z 序参照物,而是经
-/// <see cref="OverlayZOrderCoordinator.GetPredecessor"/> 问协调者要"链里排在
-/// 我前面的那个句柄"(链首时就是宿主本身,和原来行为一致)——具体怎么把这个参照物
-/// 换算成 hWndInsertAfter、怎么判断"是否已经贴对了",复用的还是原来这套对宿主做的
-/// 逻辑,只是参照物从固定的宿主换成了协调者给出的动态目标。
+/// 平铺布局(同一宿主同时显示多个 overlay,比如左右分栏)下曾经出现过多个
+/// overlay 互抢 Z 序、永不收敛的问题:早期判据是"宿主正上方紧邻的必须是我自己",
+/// 而这个位置同一时刻只有一个窗口能占住,两个 overlay 的判据永远不可能同时成立,
+/// 于是每一轮触发(哪怕只是状态栏文字刷新引起的 LayoutUpdated)都会互相插队重发
+/// SetWindowPos。修复很简单:把判据放宽成"我在宿主之上"(见
+/// <see cref="IsChildAboveOwner"/>)——平铺的几个子窗口互不重叠,它们彼此之间谁上
+/// 谁下没有任何视觉意义,只要都盖在宿主上方就是对的,多个 overlay 于是可以同时
+/// 满足判据,矛盾消失。(曾经为此引入过一个"给同宿主下的 overlay 排一条确定性
+/// Z 序链"的协调者,判据放宽之后它就没有存在意义了,已删除。)
 ///
 /// 踩过的坑:仅仅去掉 owner 关系并不够 —— SetWindowPos/ShowWindow 对不同
 /// 线程(含跨进程)的窗口默认会像 SendMessage 一样同步阻塞发送
@@ -79,14 +77,6 @@ public sealed class OverlayHost : Border
     /// 的验收标准。刻意保持 internal + 无日志,不对外暴露、不刷屏,只在调试/验证时
     /// 用调试器或临时探针读取。</summary>
     internal static long SetWindowPosCallCount;
-
-    /// <summary>协调者查询用:本 overlay 当前是否正显示着一个子窗口——true 时返回
-    /// 对应的子 HWND,否则返回 0。只有"当前正显示"的 overlay 才能被链条里排在它
-    /// 后面的 overlay 当作 Z 序参照物;隐藏/尚未挂子窗口的 overlay 返回 0,链条据此
-    /// 自动跳过它(tab 切走的 pane 不占链位)。直接复用 <c>_lastVisible</c>——它就是
-    /// "上一次成功把子窗口摆到当前位置(含 Z 序)"的标记,能准确反映"这个 overlay
-    /// 现在是不是链条里一个有效的锚点"。</summary>
-    internal nint VisibleChildHwnd => _lastVisible ? _childHwnd : 0;
 
     public OverlayHost()
     {
@@ -140,12 +130,6 @@ public sealed class OverlayHost : Border
         if (_childHwnd != 0)
             HideChildAsync(_childHwnd);
         _childHwnd = 0;
-        // 会话结束,这个 overlay 再也不会有子窗口需要钉——从它所属宿主的 Z 序链条里
-        // 摘掉自己,避免留下一个占着链位、再也用不到的僵尸登记项(见
-        // OverlayZOrderCoordinator.Unregister)。DetachChild 可能被调用两次(session
-        // 断开一次、CloseSession 一次),Unregister 本身是幂等的,重复调用无副作用。
-        if (_ownerHwnd != 0)
-            OverlayZOrderCoordinator.Unregister(_ownerHwnd, this);
         ForceNextUpdate();
     }
 
@@ -179,17 +163,7 @@ public sealed class OverlayHost : Border
         _ownerSource?.RemoveHook(OnOwnerWndProc);
         _ownerSource = null;
 
-        // 换宿主(或首次挂接)前,先把自己从旧宿主的 Z 序链条里摘掉——链条按
-        // "宿主根 HWND"分组,旧宿主对应的链位对新宿主毫无意义,留着只会让旧宿主
-        // 链条里多出一个再也不会被更新、但仍会被后续 overlay 当作(失效)参照物的
-        // 僵尸项。_ownerHwnd == 0 时说明这是第一次挂接,没有旧宿主要摘。
-        if (_ownerHwnd != 0)
-            OverlayZOrderCoordinator.Unregister(_ownerHwnd, this);
-
         _ownerHwnd = root;
-
-        // 登记到新宿主的 Z 序链条末尾(按登记序排链位,见 OverlayZOrderCoordinator)。
-        OverlayZOrderCoordinator.Register(_ownerHwnd, this);
 
         // 单独挂顶层窗口自己的 WndProc 钩子来监听移动/缩放/最小化还原,从而在
         // 宿主移动时刷新 overlay 位置 —— 纯 Win32 层面的钩子,不依赖 Window 对象,
@@ -258,9 +232,16 @@ public sealed class OverlayHost : Border
         // 这个参照物"上方"紧邻的窗口(GW_HWNDPREV),看是不是已经是子窗口自己——
         // 是则说明 Z 序已经正确,否则(参照物已是最顶端,或紧邻的是别的窗口)都
         // 需要重新插一次钉到参照物正上方。
-        nint predecessor = OverlayZOrderCoordinator.GetPredecessor(_ownerHwnd, this);
-        nint rawInsertAfter = GetNearestVisibleAbove(predecessor);
-        bool zOrderOk = rawInsertAfter == _childHwnd;
+        // 判据是"我在宿主之上",而不是"我紧贴宿主正上方"。后者同一时刻只有一个
+        // 窗口能占住,平铺布局(同一宿主同时显示多个 overlay)下多个子窗口会永远
+        // 互相插队、每一轮触发都重新 SetWindowPos,永不收敛;前者多个子窗口可以
+        // 同时满足,矛盾消失。平铺的几个子窗口互不重叠,它们彼此之间谁上谁下
+        // 没有任何视觉意义,只要都盖在宿主上方即可。
+        bool zOrderOk = IsChildAboveOwner();
+        // Z 序需要纠正时,取宿主"上方"紧邻的可见窗口作为插入锚点,把子窗口插到
+        // 它下面 —— 也就是紧贴宿主上方。返回 0 表示宿主已经是 Z 序最顶端,此时
+        // (HWND)0 恰好就是 HWND_TOP,语义正好一致,不需要特殊处理。
+        nint rawInsertAfter = GetNearestVisibleAbove(_ownerHwnd);
 
         // 脏检查:Z 序不对时(zOrderOk == false)无论位置是否变化都必须发,这是
         // 本设计维持层叠顺序的核心;Z 序已经正确时,位置/大小/可见性都和上次
@@ -316,5 +297,28 @@ public sealed class OverlayHost : Border
         while (candidate != 0 && !Win32.IsWindowVisible(candidate))
             candidate = Win32.GetWindow(candidate, Win32.GW_HWNDPREV);
         return candidate;
+    }
+
+    /// <summary>
+    /// 沿宿主的 GW_HWNDPREV 一路向"上"(Z 序更靠前)走,看能不能在有限步数内碰到
+    /// 自己的子窗口——碰到了就说明子窗口确实盖在宿主上方,Z 序无需纠正。
+    ///
+    /// 用步数上限而不是走到链表尽头:整条 Z 序链上的顶层窗口可能非常多(桌面上
+    /// 每个进程的每个顶层窗口都在里面,还包括大量不可见的内部消息窗口),而子窗口
+    /// 是被本类主动钉在宿主附近的,正常情况下几步之内就能命中;走满上限还没找到
+    /// 就当作"不在上方"、触发一次纠正——纠正本身是幂等的,偶尔多做一次没有副作用,
+    /// 总比每次判定都遍历整条链划算。
+    /// </summary>
+    private bool IsChildAboveOwner()
+    {
+        const int MaxSteps = 50;
+        nint cursor = _ownerHwnd;
+        for (int i = 0; i < MaxSteps; i++)
+        {
+            cursor = Win32.GetWindow(cursor, Win32.GW_HWNDPREV);
+            if (cursor == 0) return false;          // 已经走到 Z 序顶端,没碰到自己
+            if (cursor == _childHwnd) return true;
+        }
+        return false;
     }
 }

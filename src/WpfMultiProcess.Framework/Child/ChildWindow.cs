@@ -26,9 +26,8 @@ namespace WpfMultiProcess.Child;
 ///      的固有代价,不再用 RequestActivate 补偿(那条链路已整条删除,见
 ///      ChildShell/CommonService/SessionManager)。
 ///   2. 激活会把窗口提到系统 Z 序同级最前,这会扰乱 OverlayHost 手动维护的层叠
-///      顺序——已经由 Host.OverlayZOrderCoordinator 通过"宿主
-///      WM_WINDOWPOSCHANGED → 重新钉链条"的既有兜底路径处理,不需要子窗口这边
-///      再做什么。
+///      顺序——已经由 Host.OverlayHost 通过"宿主 WM_WINDOWPOSCHANGED → 重新钉一遍
+///      位置和 Z 序"的既有兜底路径处理,不需要子窗口这边再做什么。
 ///
 /// 真正的会话编排(channel/session_id/心跳协议/UiSaturationMeter)全部下沉到
 /// ChildShell,这里只管"窗口长什么样、Win32 怎么摆位、feature 视图往哪塞"——feature
