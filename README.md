@@ -86,7 +86,8 @@ Framework 一行代码；换一个 dock 库（比如 Infragistics `XamDockManage
 │       数据帧→OnData 更新绑定属性（波形折线 / DataGrid 行）                              │
 │    5. 点击子窗口 → 系统正常激活该窗口、拿到键盘焦点（不再有 RequestActivate 补偿链，     │
 │       代价是主窗口标题栏随之失活，见下方"窗口嵌入"设计点）                              │
-│    6. feature 按钮（统计/排序/模拟卡死）→ 各自 feature 服务的 unary RPC 或本地操作       │
+│    6. feature 按钮（统计/排序）→ 各自 feature 服务的 unary RPC；"模拟卡死 10s" 则是      │
+│       框架级调试按钮（在 ChildWindow 上，两个 feature 共用），纯本地阻塞 UI 线程         │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -266,8 +267,13 @@ Framework 一行代码；换一个 dock 库（比如 Infragistics `XamDockManage
   额外的全局数据结构去回避"判据自相矛盾"这个真正的病根；判据放宽之后它就完全没有
   存在意义了，已删除。同期还踩到过一个相关的坑：每个 WPF 子进程都自带若干
   Win32 层面完全不可见的顶层 `HwndWrapper` 消息窗口，而 `GetWindow(GW_HWNDPREV)`
-  不看可见性，"紧贴"类判据会被这些隐藏窗口卡住而永远不成立——放宽后的判据只关心
-  "能不能在宿主上方找到自己"，天然不受隐藏窗口影响。
+  不看可见性，"紧贴"类判据会被这些隐藏窗口卡住而永远不成立——为此曾加过一个
+  `GetNearestVisibleAbove`（沿 Z 序向上跳过所有不可见窗口）；放宽后的判据只关心
+  "能不能在宿主上方找到自己"，天然不受隐藏窗口影响，它也随之删除了。
+  需要纠正 Z 序时的**插入锚点**直接取 `GetWindow(宿主, GW_HWNDPREV)` 即可，不需要
+  跳过隐藏窗口：锚点只决定"插在谁下面"，插到一个隐藏窗口下面照样落在宿主上方、
+  判据随即成立并收敛（返回 0 表示宿主已是最顶端，而 `(HWND)0` 恰好就是
+  `HWND_TOP`，语义天然一致）。
 - **跨线程访问 WPF 对象**：`SessionManager.Register`/`Unregister`/`CloseSession`
   都可能在 gRPC 线程池线程（Kestrel）或 `Process.Exited`（ThreadPool）上被调用，
   而它们要碰的 `OverlayHost`（`Border`）、`IDockPane`（AvalonDock `LayoutDocument`）
@@ -287,11 +293,14 @@ Framework 一行代码；换一个 dock 库（比如 Infragistics `XamDockManage
     回到空白占位、`Session.OnDisconnected()`、`Session.DisposeOnce()`；对应的
     dock pane 关闭（用户点 pane 关闭按钮）会经 `CloseSession(sessionId,
     ShutdownReason.PaneClosed)` 单独触发子进程退出。
-  - `ShutdownReason` 枚举尽量覆盖所有已知的关闭触发源：`HostClosing`（主窗口
-    关闭）/`PaneClosed`（用户关了这个 pane）/`ClosedByApi`（调库方代码主动调用
-    `CloseSession`，默认值）/`SessionRejected`（`Register` 校验失败被拒）/
-    `Replaced`（预留：同 session 重复连接被顶掉）/`HostError`（主进程内部错误）/
-    `Restarting`（预留：重启/升级）——子进程侧收到后行为一致（关窗口），
+  - `ShutdownReason` 枚举尽量覆盖所有已知的关闭触发源。当前实现真正会发送的只有
+    三个：`HostClosing`（主窗口关闭，`CloseAll`）/`PaneClosed`（用户关了这个
+    pane）/`ClosedByApi`（调库方代码主动调用 `CloseSession`，默认值）。其余
+    `SessionRejected`（`Register` 校验失败）/`Replaced`（同 session 重复连接被
+    顶掉）/`HostError`（主进程内部错误）/`Restarting`（重启升级）都只在 proto 里
+    声明、留给将来，暂时没有任何代码路径会发出来——注意 `Register` 校验失败时
+    调用方（feature service impl）是直接结束这次 RPC，并不会推一条
+    `Shutdown{SessionRejected}`。子进程侧收到后行为一致（关窗口），
     `reason`/`detail` 只用于日志/可观测性区分"我是被谁关掉的"。
 - **子进程意外退出的处理**：`CloseSession`/`Unregister`/用户点 pane 关闭这三条
   "主动关闭"路径都会先把 entry 从 `SessionManager._entries` 里 `TryRemove` 掉，再去
@@ -338,11 +347,11 @@ Framework 一行代码；换一个 dock 库（比如 Infragistics `XamDockManage
 | `Host/Session/SessionPump.cs` | 静态助手 `PumpAsync<T>`：把 `ChannelReader<T>` 里的 envelope 转发进 `IServerStreamWriter<T>`，多数 `Session.ServeAsync` 实现的样板 |
 | `Host/Session/SessionManager.cs` | 会话层核心：`OpenFeature(featureId, featureIndex, pane)`/`Register(session, pid, hwnd)`/`Unregister`/`CloseSession`/`CloseAll`、心跳泵(2s)/无响应检测(5000ms)、`ReplyOf`、`FindSession<TSession>`、跨线程 Dispatcher 调度；子进程意外退出时打 `IsFaulted`、`OverlayHost.ShowFault`、抛 `SessionFaulted` 事件；`RestartSession(sessionId)` 复用同一 session_id 原地重启子进程 |
 | `Host/CommonServiceImpl.cs` | `CommonService` 实现（薄壳，按 session_id 转发给 SessionManager），构造注入 `ILogger<CommonServiceImpl>` |
-| `Host/OverlayHost.cs` | 占位控件：无 owner 关系，`SetWindowPos`(`SWP_ASYNCWINDOWPOS`)钉位置+手动 Z 序（feature 无关）；Z 序判据是 `IsChildAboveOwner`（沿宿主 `GW_HWNDPREV` 带步数上限向上找自己），插入锚点取 `GetNearestVisibleAbove(宿主)`；三态占位（等待接入/已接入子窗口/崩溃错误页），错误页内容可经 `FaultContentFactory` 自定义，否则用内置默认页 |
+| `Host/OverlayHost.cs` | 占位控件：无 owner 关系，`SetWindowPos`(`SWP_ASYNCWINDOWPOS`)钉位置+手动 Z 序（feature 无关）；Z 序判据是 `IsChildAboveOwner`（沿宿主 `GW_HWNDPREV` 带步数上限向上找自己），插入锚点直接取 `GetWindow(宿主, GW_HWNDPREV)`；三态占位（等待接入/已接入子窗口/崩溃错误页），错误页内容可经 `FaultContentFactory` 自定义，否则用内置默认页 |
 | `Child/ChildStartOptions.cs` | 子进程启动参数：featureId/featureIndex/sessionId/socketPath/hostPid |
 | `Child/ChildProgram.cs` | 子进程通用入口：`Run(IHost host, ChildStartOptions, IReadOnlyList<IFeatureChild>)`——孤儿自杀看护 + 从 `host.Services` 取 `ILoggerFactory`/`Application` + 拉起 `ChildWindow` + bootstrap(建 channel/`ChildShell` → `IFeatureChild.CreateViewModel`/`CreateView` → `Start()`) |
 | `Child/ChildContext.cs` | `{Channel, SessionId, FeatureIndex, Shell}` 只读结构体，传给 `IFeatureChild.CreateViewModel` |
-| `Child/ChildWindow.cs` | 无边框子窗口：仅 `WS_EX_TOOLWINDOW`（完全可激活，键盘输入需要）、初始位置屏幕外、`SourceReady`/`Closed` 接缝 |
+| `Child/ChildWindow.cs` | 无边框子窗口：仅 `WS_EX_TOOLWINDOW`（完全可激活，键盘输入需要）、初始位置屏幕外、`SourceReady`/`Closed` 接缝；"模拟卡死 10s" 按钮也在这里——它是框架级、feature 无关的调试 affordance（两个 feature 共用），不属于任何具体 feature |
 | `Child/ChildShell.cs` | 子进程框架状态条：持有 Hwnd、暴露 `Logger`、`ApplyReply`(标题/主题色)、`SendPong`、`RequestClose`、拉起/停止 `UiSaturationMeter`（`RequestActivate` 已随 Problem 1 修复删除） |
 | `Child/UiSaturationMeter.cs` | 框架级、feature-无关：后台线程探针积分 UI 线程饱和度(权威值) + `Dispatcher.Hooks` 归因，经 `CommonService.ReportUiStats` 上报 |
 | `Child/IFeatureChild.cs` | 调库方子进程侧接缝：`FeatureId`/`CreateViewModel(ChildContext)`/`CreateView(FeatureViewModel)` |
@@ -361,7 +370,7 @@ Framework 一行代码；换一个 dock 库（比如 Infragistics `XamDockManage
 | `Host/AvalonDockPane.cs` | `IDockPane` 的 AvalonDock 实现：包一个调用方已经建好并加进 `LayoutDocumentPane` 的 `LayoutDocument` |
 | `Host/Features/Waveform/WaveformFeature.cs`, `WaveformSession.cs`, `WaveformServiceImpl.cs` | 波形 feature：`IFeatureHost` 实现 + `Session` 子类(内部 `Channel<WaveformDown>` + 50ms 正弦帧 producer) + gRPC 服务实现(Register 里自己 `new` Session → `SessionManager.Register` 校验 → 写 Reply → `session.ServeAsync`，GetStatistics unary 经 `FindSession` 读快照) |
 | `Host/Features/Table/TableFeature.cs`, `TableSession.cs`, `TableServiceImpl.cs` | 表格 feature：同上模式，动态行(增删/变值) + Sort unary |
-| `Child/Features/Waveform/WaveformFeatureChild.cs`, `WaveformViewModel.cs`, `WaveformView.cs` | 波形子进程侧：`IFeatureChild` 实现 + `FeatureViewModel<WaveformDown>` 子类(自己发起 Register) + Polyline 渲染视图(隐藏时暂停) + 统计/模拟卡死按钮 |
+| `Child/Features/Waveform/WaveformFeatureChild.cs`, `WaveformViewModel.cs`, `WaveformView.cs` | 波形子进程侧：`IFeatureChild` 实现 + `FeatureViewModel<WaveformDown>` 子类(自己发起 Register) + Polyline 渲染视图(隐藏时暂停) + 统计按钮、键盘测试输入框 |
 | `Child/Features/Table/TableFeatureChild.cs`, `TableViewModel.cs`, `TableView.cs` | 表格子进程侧：同上，DataGrid + 排序按钮 |
 
 ## 已验证的运行时行为

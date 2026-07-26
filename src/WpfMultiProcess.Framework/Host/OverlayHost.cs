@@ -111,7 +111,11 @@ public sealed class OverlayHost : Border
     /// </summary>
     private void ScheduleUpdate()
     {
-        if (_updatePending) return;
+        if (_updatePending)
+        {
+            return;
+        }
+
         _updatePending = true;
         Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
         {
@@ -142,7 +146,10 @@ public sealed class OverlayHost : Border
     public void DetachChild()
     {
         if (_childHwnd != 0)
+        {
             HideChildAsync(_childHwnd);
+        }
+
         _childHwnd = 0;
         ForceNextUpdate();
     }
@@ -239,11 +246,21 @@ public sealed class OverlayHost : Border
     /// </summary>
     private void HookOwner()
     {
-        if (PresentationSource.FromVisual(this) is not HwndSource src) return;
+        if (PresentationSource.FromVisual(this) is not HwndSource src)
+        {
+            return;
+        }
 
         nint root = Win32.GetAncestor(src.Handle, Win32.GA_ROOT);
-        if (root == 0) root = src.Handle;
-        if (root == _ownerHwnd) return;
+        if (root == 0)
+        {
+            root = src.Handle;
+        }
+
+        if (root == _ownerHwnd)
+        {
+            return;
+        }
 
         _ownerSource?.RemoveHook(OnOwnerWndProc);
         _ownerSource = null;
@@ -271,22 +288,35 @@ public sealed class OverlayHost : Border
         // WM_WINDOWPOSCHANGED 覆盖移动、缩放、显示/隐藏、Z 序变化。拖动主窗口时
         // 这个消息会连续触发很多次,同样走去抖合并,避免过程中排一堆 SetWindowPos。
         if (msg == Win32.WM_WINDOWPOSCHANGED)
+        {
             ScheduleUpdate();
+        }
+
         return 0;
     }
 
     /// <summary>把子窗口钉在占位区域的屏幕坐标上;占位不可见时隐藏子窗口。</summary>
     private void UpdatePlacement()
     {
-        if (_childHwnd == 0) return;
+        if (_childHwnd == 0)
+        {
+            return;
+        }
 
         // 兜底:LayoutUpdated/IsVisibleChanged 可能在 dock↔float 切换后、
         // HookOwner 真正跑到之前先触发,这里检测到宿主已经变了就立刻重新挂接。
         if (PresentationSource.FromVisual(this) is HwndSource curSrc)
         {
             nint curRoot = Win32.GetAncestor(curSrc.Handle, Win32.GA_ROOT);
-            if (curRoot == 0) curRoot = curSrc.Handle;
-            if (curRoot != _ownerHwnd) HookOwner();
+            if (curRoot == 0)
+            {
+                curRoot = curSrc.Handle;
+            }
+
+            if (curRoot != _ownerHwnd)
+            {
+                HookOwner();
+            }
         }
 
         bool show = IsLoaded && IsVisible && ActualWidth > 0 && ActualHeight > 0
@@ -310,23 +340,21 @@ public sealed class OverlayHost : Border
         int cx = Math.Max(1, (int)Math.Round(br.X - tl.X));
         int cy = Math.Max(1, (int)Math.Round(br.Y - tl.Y));
 
-        // 没有 owner 关系后,子窗口的 Z 序不再被系统自动维持在参照物上方,这里
-        // 每次都手动算一遍:先问协调者要"链条里排在我前面的那个句柄"(链首时就是
-        // 宿主本身,和没有协调者之前完全一样;平铺布局下会是同一宿主下另一个
-        // overlay 的子 HWND,见 OverlayZOrderCoordinator.GetPredecessor),再取
-        // 这个参照物"上方"紧邻的窗口(GW_HWNDPREV),看是不是已经是子窗口自己——
-        // 是则说明 Z 序已经正确,否则(参照物已是最顶端,或紧邻的是别的窗口)都
-        // 需要重新插一次钉到参照物正上方。
-        // 判据是"我在宿主之上",而不是"我紧贴宿主正上方"。后者同一时刻只有一个
-        // 窗口能占住,平铺布局(同一宿主同时显示多个 overlay)下多个子窗口会永远
-        // 互相插队、每一轮触发都重新 SetWindowPos,永不收敛;前者多个子窗口可以
-        // 同时满足,矛盾消失。平铺的几个子窗口互不重叠,它们彼此之间谁上谁下
-        // 没有任何视觉意义,只要都盖在宿主上方即可。
+        // 没有 owner 关系后,子窗口的 Z 序不再被系统自动维持在宿主上方,只能每次
+        // 手动判一遍、不对就重钉。判据是"我在宿主之上"而不是"我紧贴宿主正上方":
+        // 后者同一时刻只有一个窗口能占住,平铺布局(同一宿主同时显示多个 overlay)
+        // 下多个子窗口会永远互相插队、每一轮触发都重发 SetWindowPos,永不收敛;
+        // 前者多个子窗口可以同时满足,矛盾消失。平铺的几个子窗口互不重叠,它们
+        // 彼此之间谁上谁下没有任何视觉意义,只要都盖在宿主上方即可。
         bool zOrderOk = IsChildAboveOwner();
-        // Z 序需要纠正时,取宿主"上方"紧邻的可见窗口作为插入锚点,把子窗口插到
-        // 它下面 —— 也就是紧贴宿主上方。返回 0 表示宿主已经是 Z 序最顶端,此时
-        // (HWND)0 恰好就是 HWND_TOP,语义正好一致,不需要特殊处理。
-        nint rawInsertAfter = GetNearestVisibleAbove(_ownerHwnd);
+        // 需要纠正时,拿宿主"上方"紧邻的窗口当插入锚点,把子窗口插到它下面——也就是
+        // 紧贴宿主上方。返回 0 表示宿主已经是 Z 序最顶端,此时 (HWND)0 恰好就是
+        // HWND_TOP,语义正好一致,不需要特殊处理。
+        // 这里不需要像判据那样跳过不可见窗口(WPF 每个进程都自带若干 Win32 层面
+        // 不可见的 HwndWrapper 消息窗口):锚点只决定"插在谁下面",插到一个隐藏
+        // 窗口下面照样落在宿主上方,判据随即成立、收敛。真正会被这些隐藏窗口卡住
+        // 的是"紧贴"式判据,而它已经被上面的 IsChildAboveOwner 取代了。
+        nint rawInsertAfter = Win32.GetWindow(_ownerHwnd, Win32.GW_HWNDPREV);
 
         // 脏检查:Z 序不对时(zOrderOk == false)无论位置是否变化都必须发,这是
         // 本设计维持层叠顺序的核心;Z 序已经正确时,位置/大小/可见性都和上次
@@ -334,7 +362,9 @@ public sealed class OverlayHost : Border
         // 落进这个"跳过"分支,SetWindowPos 调用量随之大幅下降。
         if (_lastVisible && zOrderOk && _lastZOrderOk
             && x == _lastX && y == _lastY && cx == _lastCx && cy == _lastCy)
+        {
             return;
+        }
 
         uint zFlags = Win32.SWP_NOACTIVATE | Win32.SWP_SHOWWINDOW | Win32.SWP_ASYNCWINDOWPOS;
         nint insertAfter = rawInsertAfter;
@@ -361,30 +391,6 @@ public sealed class OverlayHost : Border
     }
 
     /// <summary>
-    /// 实测踩过的坑(平铺布局下两个 overlay 永不收敛地反复互相"纠正"):每个 WPF
-    /// 子进程启动时都会自带至少一个 Win32 层面完全不可见、纯内部用途的顶层
-    /// "HwndWrapper"消息窗口(PresentationCore/WPF 自己创建的,和本框架挂的那个
-    /// 可见子窗口是同一进程下两个不同的顶层句柄)。GetWindow(x, GW_HWNDPREV) 不看
-    /// 可见性,只要 Z 序上紧邻,这个隐藏窗口就可能被读出来。之前直接把这个原始
-    /// 结果拿去跟 _childHwnd 比较——如果这个隐藏窗口恰好长期卡在"参照物正上方"这个
-    /// Z 序位置(实测确有此现象,原因不明,大概率是同进程其它顶层窗口在 Z 序上
-    /// 天然聚在一起,不会随之后的 SetWindowPos 调整而挪走),对应的 overlay 就永远
-    /// 判定"Z 序不对"、永远重新插一次,而插入之后紧邻的还是那个隐藏窗口(它没有
-    /// 被这次 SetWindowPos 挪动,只是被顶到了新插入的可见窗口下面而已)——于是
-    /// 每一轮触发(不管间隔多久)都会重新发一次 SetWindowPos,永不收敛,累计调用量
-    /// 线性增长。修复:判断"参照物正上方是不是我自己"时,要跳过所有不可见的
-    /// 顶层窗口,一直找到第一个可见的为止,再跟 _childHwnd 比较——这才是这套
-    /// Z 序纠正机制真正关心的"可见层叠顺序",隐藏的内部窗口不该参与判定。
-    /// </summary>
-    private static nint GetNearestVisibleAbove(nint hwnd)
-    {
-        nint candidate = Win32.GetWindow(hwnd, Win32.GW_HWNDPREV);
-        while (candidate != 0 && !Win32.IsWindowVisible(candidate))
-            candidate = Win32.GetWindow(candidate, Win32.GW_HWNDPREV);
-        return candidate;
-    }
-
-    /// <summary>
     /// 沿宿主的 GW_HWNDPREV 一路向"上"(Z 序更靠前)走,看能不能在有限步数内碰到
     /// 自己的子窗口——碰到了就说明子窗口确实盖在宿主上方,Z 序无需纠正。
     ///
@@ -401,8 +407,15 @@ public sealed class OverlayHost : Border
         for (int i = 0; i < MaxSteps; i++)
         {
             cursor = Win32.GetWindow(cursor, Win32.GW_HWNDPREV);
-            if (cursor == 0) return false;          // 已经走到 Z 序顶端,没碰到自己
-            if (cursor == _childHwnd) return true;
+            if (cursor == 0)
+            {
+                return false;          // 已经走到 Z 序顶端,没碰到自己
+            }
+
+            if (cursor == _childHwnd)
+            {
+                return true;
+            }
         }
         return false;
     }
