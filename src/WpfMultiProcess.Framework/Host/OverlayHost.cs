@@ -56,6 +56,7 @@ public sealed class OverlayHost : Border
     private nint _childHwnd;
     private nint _ownerHwnd;
     private HwndSource? _ownerSource;
+    private IDockPane? _parent;
 
     /// <summary>"等待子进程窗口接入…" 占位内容,构造时造好存成字段——AttachChild 成功接上
     /// 子窗口、以及 RestartSession 重新拉起子进程之前,都要把 Child 打回这个中性状态(可能是
@@ -87,7 +88,7 @@ public sealed class OverlayHost : Border
     /// 用调试器或临时探针读取。</summary>
     internal static long SetWindowPosCallCount;
 
-    public OverlayHost()
+    public OverlayHost(IDockPane pane)
     {
         Background = new SolidColorBrush(Color.FromRgb(0x1E, 0x1E, 0x1E));
         _waitingContent = new TextBlock
@@ -99,6 +100,9 @@ public sealed class OverlayHost : Border
         };
         Child = _waitingContent;
 
+        _parent = pane;
+        pane.Activated += OnPaneActivated;
+        pane.Closed += OnPaneClosed;
         Loaded += (_, _) => HookOwner();
         Unloaded += (_, _) => ScheduleUpdate();    // 被拖出/隐藏时先藏起子窗口
         LayoutUpdated += (_, _) => ScheduleUpdate();
@@ -122,6 +126,18 @@ public sealed class OverlayHost : Border
             _updatePending = false;
             UpdatePlacement();
         }));
+    }
+
+    private void OnPaneActivated(object? sender, EventArgs e) => ScheduleUpdate();
+
+    private void OnPaneClosed(object? sender, EventArgs e)
+    {
+        if (_parent is { } pane)
+        {
+            pane.Activated -= OnPaneActivated;
+            pane.Closed -= OnPaneClosed;
+            _parent = null;
+        }
     }
 
     /// <summary>强制下一次 UpdatePlacement 无视脏检查、一定发送一次。</summary>
@@ -347,14 +363,6 @@ public sealed class OverlayHost : Border
         // 前者多个子窗口可以同时满足,矛盾消失。平铺的几个子窗口互不重叠,它们
         // 彼此之间谁上谁下没有任何视觉意义,只要都盖在宿主上方即可。
         bool zOrderOk = IsChildAboveOwner();
-        // 需要纠正时,拿宿主"上方"紧邻的窗口当插入锚点,把子窗口插到它下面——也就是
-        // 紧贴宿主上方。返回 0 表示宿主已经是 Z 序最顶端,此时 (HWND)0 恰好就是
-        // HWND_TOP,语义正好一致,不需要特殊处理。
-        // 这里不需要像判据那样跳过不可见窗口(WPF 每个进程都自带若干 Win32 层面
-        // 不可见的 HwndWrapper 消息窗口):锚点只决定"插在谁下面",插到一个隐藏
-        // 窗口下面照样落在宿主上方,判据随即成立、收敛。真正会被这些隐藏窗口卡住
-        // 的是"紧贴"式判据,而它已经被上面的 IsChildAboveOwner 取代了。
-        nint rawInsertAfter = Win32.GetWindow(_ownerHwnd, Win32.GW_HWNDPREV);
 
         // 脏检查:Z 序不对时(zOrderOk == false)无论位置是否变化都必须发,这是
         // 本设计维持层叠顺序的核心;Z 序已经正确时,位置/大小/可见性都和上次
@@ -366,13 +374,21 @@ public sealed class OverlayHost : Border
             return;
         }
 
-        uint zFlags = Win32.SWP_NOACTIVATE | Win32.SWP_SHOWWINDOW | Win32.SWP_ASYNCWINDOWPOS;
-        nint insertAfter = rawInsertAfter;
+        uint zFlags = Win32.SWP_SHOWWINDOW | Win32.SWP_ASYNCWINDOWPOS;
+
+        // 需要纠正时,拿宿主"上方"紧邻的窗口当插入锚点,把子窗口插到它下面——也就是
+        // 紧贴宿主上方。返回 0 表示宿主已经是 Z 序最顶端,此时 (HWND)0 恰好就是
+        // HWND_TOP,语义正好一致,不需要特殊处理。
+        // 这里不需要像判据那样跳过不可见窗口(WPF 每个进程都自带若干 Win32 层面
+        // 不可见的 HwndWrapper 消息窗口):锚点只决定"插在谁下面",插到一个隐藏
+        // 窗口下面照样落在宿主上方,判据随即成立、收敛。真正会被这些隐藏窗口卡住
+        // 的是"紧贴"式判据,而它已经被上面的 IsChildAboveOwner 取代了。
+        nint insertAfter = Win32.GetWindow(_ownerHwnd, Win32.GW_HWNDPREV);
         if (zOrderOk)
         {
             // SetWindowPos 的 hWndInsertAfter 传自身会失败/无效果,这里直接跳过、
             // 只保留 SWP_NOZORDER,只更新位置/大小。
-            zFlags |= Win32.SWP_NOZORDER;
+            zFlags |= Win32.SWP_NOZORDER | Win32.SWP_NOACTIVATE;
             insertAfter = 0;
         }
         // else: rawInsertAfter 要么是 0(GW_HWNDPREV 返回 0 表示参照物已经是 Z 序

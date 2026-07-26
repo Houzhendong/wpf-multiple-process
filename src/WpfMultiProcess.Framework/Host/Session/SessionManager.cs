@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 using WpfMultiProcess.Ipc.Common;
@@ -124,7 +124,7 @@ public sealed class SessionManager : IDisposable
 
         string sessionId = Guid.NewGuid().ToString();
 
-        var overlay = new OverlayHost();
+        var overlay = new OverlayHost(pane);
         pane.SetContent(overlay);
 
         var entry = new SessionEntry
@@ -192,13 +192,17 @@ public sealed class SessionManager : IDisposable
         lock (entry.Gate)
         {
             if (!ReferenceEquals(entry.Process, exitedProcess))
+            {
                 return; // 上一个已经被 RestartSession 替换掉的旧进程,延迟触发的 Exited,忽略
+            }
 
             int exitCode = SafeExitCode(exitedProcess);
             FeatureLog?.Invoke($"{entry.FeatureId}#{entry.FeatureIndex}", $"子进程退出 (code {exitCode})");
 
             if (!_entries.TryGetValue(sessionId, out var current) || !ReferenceEquals(current, entry))
+            {
                 return; // entry 已经被 CloseSession 移除,这是主动关闭路径里 Kill 兜底触发的正常 Exited
+            }
 
             entry.IsFaulted = true;
             _logger.LogWarning(
@@ -233,17 +237,27 @@ public sealed class SessionManager : IDisposable
     /// </summary>
     public void RestartSession(string sessionId)
     {
-        if (!_entries.TryGetValue(sessionId, out var entry)) return; // 用户没点重试就先关了 pane,entry 已经被彻底清理,无事可做
+        if (!_entries.TryGetValue(sessionId, out var entry))
+        {
+            return; // 用户没点重试就先关了 pane,entry 已经被彻底清理,无事可做
+        }
 
         lock (entry.Gate)
         {
-            if (!entry.IsFaulted) return; // 不是故障态(比如错误页按钮被连点两次),避免重复重启一个还活着/已经在重启中的会话
+            if (!entry.IsFaulted)
+            {
+                return; // 不是故障态(比如错误页按钮被连点两次),避免重复重启一个还活着/已经在重启中的会话
+            }
 
             if (entry.Session is { } oldSession)
             {
                 _connected.TryRemove(sessionId, out _);
                 _lastPongMs.TryRemove(sessionId, out _);
-                lock (_unresponsiveLock) _unresponsive.Remove(sessionId);
+                lock (_unresponsiveLock)
+                {
+                    _unresponsive.Remove(sessionId);
+                }
+
                 oldSession.DisposeOnce();
                 entry.Session = null;
             }
@@ -272,7 +286,10 @@ public sealed class SessionManager : IDisposable
     public void CloseSession(string sessionId,
         ShutdownReason reason = ShutdownReason.ClosedByApi, string detail = "")
     {
-        if (!_entries.TryRemove(sessionId, out var entry)) return;
+        if (!_entries.TryRemove(sessionId, out var entry))
+        {
+            return;
+        }
 
         _logger.LogInformation("CloseSession: sessionId={SessionId} featureId={FeatureId} reason={Reason} detail={Detail}",
             sessionId, entry.FeatureId, reason, detail);
@@ -297,7 +314,10 @@ public sealed class SessionManager : IDisposable
         try
         {
             bool exited = await Task.Run(() => proc.WaitForExit(1500));
-            if (!exited) proc.Kill();
+            if (!exited)
+            {
+                proc.Kill();
+            }
         }
         catch { /* 已退出 */ }
     }
@@ -307,7 +327,9 @@ public sealed class SessionManager : IDisposable
     public void CloseAll()
     {
         foreach (var sessionId in _entries.Keys.ToList())
+        {
             CloseSession(sessionId, ShutdownReason.HostClosing);
+        }
     }
 
     /// <summary>feature 自己的 gRPC service 实现在 Register 收到开流请求(带
@@ -366,11 +388,16 @@ public sealed class SessionManager : IDisposable
     public void Unregister(Session session)
     {
         if (!_connected.TryGetValue(session.SessionId, out var cur) || !ReferenceEquals(cur, session))
+        {
             return; // 已经被更新的会话替换,不是"自己"的注册,防止误删
+        }
 
         _connected.TryRemove(session.SessionId, out _);
         _lastPongMs.TryRemove(session.SessionId, out _);
-        lock (_unresponsiveLock) _unresponsive.Remove(session.SessionId);
+        lock (_unresponsiveLock)
+        {
+            _unresponsive.Remove(session.SessionId);
+        }
 
         if (_entries.TryGetValue(session.SessionId, out var entry))
         {
@@ -392,7 +419,10 @@ public sealed class SessionManager : IDisposable
         var descriptor = _features.First(f => f.FeatureId == featureId).Descriptor;
         var reply = new RegisterReply { Title = descriptor.Title, AccentColor = descriptor.AccentColor };
         foreach (var kv in descriptor.Settings)
+        {
             reply.Settings.Add(kv.Key, kv.Value);
+        }
+
         return reply;
     }
 
@@ -404,7 +434,11 @@ public sealed class SessionManager : IDisposable
     public void OnPong(string sessionId, PongRequest request)
     {
         _lastPongMs[sessionId] = NowMs();
-        if (!_entries.TryGetValue(sessionId, out var entry) || entry.Session is not { } session) return;
+        if (!_entries.TryGetValue(sessionId, out var entry) || entry.Session is not { } session)
+        {
+            return;
+        }
+
         double rtt = NowMs() - request.PingTimestampMs;
         session.OnPong(request.Seq, rtt);
         PongReceived?.Invoke(sessionId, entry.FeatureId, request.Seq, rtt);
@@ -436,7 +470,9 @@ public sealed class SessionManager : IDisposable
                 long seq = ++_pingSeq;
                 var ping = new Ping { Seq = seq, TimestampMs = NowMs() };
                 foreach (var session in _connected.Values)
+                {
                     session.SendHeartbeat(ping);
+                }
 
                 CheckUnresponsive();
             }
@@ -453,8 +489,16 @@ public sealed class SessionManager : IDisposable
         long now = NowMs();
         foreach (var session in _connected.Values)
         {
-            if (!_lastPongMs.TryGetValue(session.SessionId, out var last)) continue;
-            if (!_entries.TryGetValue(session.SessionId, out var entry)) continue;
+            if (!_lastPongMs.TryGetValue(session.SessionId, out var last))
+            {
+                continue;
+            }
+
+            if (!_entries.TryGetValue(session.SessionId, out var entry))
+            {
+                continue;
+            }
+
             double elapsed = now - last;
             bool isUnresponsiveNow = elapsed > UnresponsiveThresholdMs;
 
