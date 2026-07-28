@@ -383,13 +383,12 @@ public sealed class OverlayHost : Border
         // 不可见的 HwndWrapper 消息窗口):锚点只决定"插在谁下面",插到一个隐藏
         // 窗口下面照样落在宿主上方,判据随即成立、收敛。真正会被这些隐藏窗口卡住
         // 的是"紧贴"式判据,而它已经被上面的 IsChildAboveOwner 取代了。
-        nint insertAfter = Win32.GetWindow(_ownerHwnd, Win32.GW_HWNDPREV);
-        if (zOrderOk)
+        if (!zOrderOk)
         {
             // SetWindowPos 的 hWndInsertAfter 传自身会失败/无效果,这里直接跳过、
             // 只保留 SWP_NOZORDER,只更新位置/大小。
-            zFlags |= Win32.SWP_NOZORDER | Win32.SWP_NOACTIVATE;
-            insertAfter = 0;
+            nint insertAfter = Win32.GetWindow(_ownerHwnd, Win32.GW_HWNDPREV);
+            Win32.SetWindowPos(_childHwnd, insertAfter, 0, 0, 0, 0, zFlags | Win32.SWP_NOMOVE | Win32.SWP_NOSIZE | Win32.SWP_NOACTIVATE);
         }
         // else: rawInsertAfter 要么是 0(GW_HWNDPREV 返回 0 表示参照物已经是 Z 序
         // 最顶端窗口,直接把子窗口插到 HWND_TOP——(HWND)0 和"没有更上面的窗口"
@@ -400,7 +399,7 @@ public sealed class OverlayHost : Border
         // 没有它的话,子窗口卡死时这一句 SetWindowPos 会把调用方(主进程 UI
         // 线程)一起拖住,又变相重新引入了本类要修复的"一个卡死全部卡死"。
         System.Threading.Interlocked.Increment(ref SetWindowPosCallCount);
-        Win32.SetWindowPos(_childHwnd, insertAfter, x, y, cx, cy, zFlags);
+        Win32.SetWindowPos(_childHwnd, 0, x, y, cx, cy, zFlags | Win32.SWP_NOZORDER);
         _lastVisible = true;
         _lastX = x; _lastY = y; _lastCx = cx; _lastCy = cy;
         _lastZOrderOk = zOrderOk;
