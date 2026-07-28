@@ -2,6 +2,7 @@
 using System.Windows.Controls;
 using System.Windows.Interop;
 using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using WpfMultiProcess.Ipc;
 
@@ -81,6 +82,16 @@ public sealed class OverlayHost : Border
     // LayoutUpdated 去抖:同一轮消息循环里可能触发很多次,合并成一次即可,
     // 用 Dispatcher.BeginInvoke(Loaded) 排到"本轮布局全部落定之后"再执行。
     private bool _updatePending;
+
+    // tab 切换/宿主临时不可见时,子窗口的隐藏(SetWindowPos+HIDEWINDOW,异步 post)和
+    // 新内容的显示之间总有一段真空期,这段时间 WPF 这边的 Border 会露出 Child 当前的内容——
+    // 平时是 _waitingContent,一块突兀的空白/纯色块,切换时看起来就是"闪一下"。缓解办法:
+    // 隐藏前用 BitBlt 把子窗口当前占的那块屏幕区域(此时还没隐藏,DWM 已经合成好了)拷一份
+    // 静态图当 Child,真空期露出来的就是它自己刚才的画面,视觉上和子窗口本身几乎无缝衔接。
+    // 特意不用 PrintWindow 叫子窗口"自己再画一遍给我"——那本质上是跨进程发消息等回复,
+    // 子进程 UI 线程卡死会连带卡住调用方(和本文件其余部分一直在规避的问题一样)。改成直接
+    // BitBlt 桌面 DC(GetDC(0))里已经合成好的像素,纯读操作,不跟子进程的消息队列打交道,
+    // 天然不会被子窗口卡死拖住,可以直接同步跑在 UI 线程上,不需要额外起线程。
 
     /// <summary>验证/诊断用:所有 OverlayHost 实例累计实际发出的 SetWindowPos 调用
     /// 次数(含隐藏路径)。平铺布局静止后这个数字应该停止增长——这是 Z 序链收敛与否
@@ -255,6 +266,94 @@ public sealed class OverlayHost : Border
     }
 
     /// <summary>
+    /// 给子窗口当前所在的屏幕区域截一张静态图,顶替 Child 当前内容,充当"备份"——盖住
+    /// 子窗口意外露出底下空白的两种场景:1) tab 切走、子窗口真正被隐藏到下次显示之间的
+    /// 真空期(见 UpdatePlacement 的 !show 分支);2) tab 没切、只是焦点在主/子窗口间来回
+    /// 切换导致 Z 序被系统瞬间打乱(见 UpdatePlacement 里 zOrderOk 分支)——这种情况下
+    /// overlay 全程可见,不会经过第 1 种场景的隐藏路径,只能靠这里持续刷新的备份兜底。
+    /// 用 BitBlt 直接读桌面 DC 已经合成好的像素(调用时子窗口还显示在原位),不发消息给
+    /// 子窗口、不跟它的消息队列打交道,天然不会被子窗口卡死拖住,同步跑在 UI 线程上即可,
+    /// 不需要额外起线程。截图纯粹是锦上添花,任何失败都不能影响主流程。
+    /// </summary>
+    private void RefreshSnapshot()
+    {
+        if (_lastCx <= 0 || _lastCy <= 0)
+        {
+            return;
+        }
+
+        try
+        {
+            if (CaptureScreenRegion(_lastX, _lastY, _lastCx, _lastCy) is { } snapshot)
+            {
+                Child = new Image { Source = snapshot, Stretch = Stretch.Fill };
+            }
+        }
+        catch
+        {
+            // 截屏失败就维持原状(通常是 _waitingContent),不能影响隐藏流程本身。
+        }
+    }
+
+    /// <summary>
+    /// 用 BitBlt 把桌面(x, y, width, height)这块屏幕区域拷进一张离屏位图再转成
+    /// BitmapSource。纯粹的像素拷贝,不涉及任何跨进程/跨线程消息。
+    /// </summary>
+    private static BitmapSource? CaptureScreenRegion(int x, int y, int width, int height)
+    {
+        nint screenDc = Win32.GetDC(0);
+        if (screenDc == 0)
+        {
+            return null;
+        }
+
+        nint memDc = 0, bitmap = 0, oldObj = 0;
+        try
+        {
+            memDc = Win32.CreateCompatibleDC(screenDc);
+            if (memDc == 0)
+            {
+                return null;
+            }
+
+            bitmap = Win32.CreateCompatibleBitmap(screenDc, width, height);
+            if (bitmap == 0)
+            {
+                return null;
+            }
+
+            oldObj = Win32.SelectObject(memDc, bitmap);
+            if (!Win32.BitBlt(memDc, 0, 0, width, height, screenDc, x, y, Win32.SRCCOPY))
+            {
+                return null;
+            }
+
+            var source = Imaging.CreateBitmapSourceFromHBitmap(bitmap, nint.Zero, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
+            source.Freeze();
+            return source;
+        }
+        finally
+        {
+            if (oldObj != 0)
+            {
+                Win32.SelectObject(memDc, oldObj);
+            }
+
+            if (bitmap != 0)
+            {
+                Win32.DeleteObject(bitmap);
+            }
+
+            if (memDc != 0)
+            {
+                Win32.DeleteDC(memDc);
+            }
+
+            Win32.ReleaseDC(0, screenDc);
+        }
+    }
+
+    /// <summary>
     /// 重新解析当前承载渲染的顶层窗口句柄(dock 状态下是主窗口,浮动状态下是
     /// AvalonDock 生成的浮动窗口)。宿主发生变化时(dock↔float 切换)重挂
     /// 窗口消息钩子,并重新把子窗口的 Z 序钉到新宿主上方(不建立 owner 关系,
@@ -342,6 +441,10 @@ public sealed class OverlayHost : Border
         {
             if (_lastVisible)
             {
+                // 隐藏前再刷新一次,保证「tab 切走」这条路径下备份一定是最新的,不必
+                // 依赖上一次 Z 序健康时顺手刷新的(可能略旧的)那一份。BitBlt 同步、
+                // 开销很小,两处都刷新并不冲突。
+                RefreshSnapshot();
                 HideChildAsync(_childHwnd);
                 _lastVisible = false;
             }
@@ -390,10 +493,21 @@ public sealed class OverlayHost : Border
             nint insertAfter = Win32.GetWindow(_ownerHwnd, Win32.GW_HWNDPREV);
             Win32.SetWindowPos(_childHwnd, insertAfter, 0, 0, 0, 0, zFlags | Win32.SWP_NOMOVE | Win32.SWP_NOSIZE | Win32.SWP_NOACTIVATE);
         }
-        // else: rawInsertAfter 要么是 0(GW_HWNDPREV 返回 0 表示参照物已经是 Z 序
-        // 最顶端窗口,直接把子窗口插到 HWND_TOP——(HWND)0 和"没有更上面的窗口"
-        // 恰好是同一个值——就是紧贴参照物上方),要么是别的窗口,两种情况都保留
-        // insertAfter 原值、不加 SWP_NOZORDER,让 SetWindowPos 真正调整 Z 序。
+        else
+        {
+            // rawInsertAfter 要么是 0(GW_HWNDPREV 返回 0 表示参照物已经是 Z 序最顶端窗口,
+            // 直接把子窗口插到 HWND_TOP——(HWND)0 和"没有更上面的窗口"恰好是同一个值——
+            // 就是紧贴参照物上方),要么是别的窗口,两种情况都保留 insertAfter 原值、不加
+            // SWP_NOZORDER,让下面的 SetWindowPos 真正调整 Z 序,这里不需要额外处理。
+
+            // Z 序目前是健康的,借这次真正下发 SetWindowPos 之前顺手刷新一次快照备份——
+            // 专门覆盖"tab 没切、只是焦点在主/子窗口间来回切换导致 Z 序被系统瞬间插到
+            // 前面"这种场景:overlay 全程 IsVisible,走不到上面 !show 分支那次刷新,
+            // 备份如果一直不更新就会停留在最初的 _waitingContent,盖不住被打乱 Z 序时
+            // 露出来的空白。反过来,Z 序不健康的这一刻(上面 if 分支)不刷新——此时屏幕
+            // 上大概率已经是刚闪出来的错误画面,截了也没用,不如维持上一份还算新鲜的备份。
+            RefreshSnapshot();
+        }
 
         // SWP_ASYNCWINDOWPOS 是这里最关键的一个 flag:见 Win32.cs 常量注释,
         // 没有它的话,子窗口卡死时这一句 SetWindowPos 会把调用方(主进程 UI

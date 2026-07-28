@@ -75,4 +75,40 @@ public static partial class Win32
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static partial bool IsWindowVisible(nint hWnd);
+
+    /// <summary>BitBlt 的 rop:直接拷贝源像素,不做任何逻辑运算。</summary>
+    public const uint SRCCOPY = 0x00CC0020;
+
+    /// <summary>
+    /// 把一块设备上下文里的像素拷贝到另一块——用于给切换瞬间的过渡占位截一张桌面区域的
+    /// 静态快照(见 OverlayHost)。特意不用 PrintWindow(叫目标窗口"自己再画一遍给我",
+    /// 和 SendMessage 语义相同,子进程卡死会拖住调用方所在线程);BitBlt 只是读源 DC 里
+    /// 已经合成好的像素,不跟任何窗口的消息队列打交道,可以放心同步跑在 UI 线程上。
+    /// </summary>
+    [LibraryImport("gdi32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool BitBlt(nint hdcDest, int xDest, int yDest, int width, int height, nint hdcSrc, int xSrc, int ySrc, uint rop);
+
+    [LibraryImport("user32.dll")]
+    public static partial nint GetDC(nint hWnd);
+
+    [LibraryImport("user32.dll")]
+    public static partial int ReleaseDC(nint hWnd, nint hDC);
+
+    [LibraryImport("gdi32.dll")]
+    public static partial nint CreateCompatibleDC(nint hdc);
+
+    [LibraryImport("gdi32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool DeleteDC(nint hdc);
+
+    [LibraryImport("gdi32.dll")]
+    public static partial nint CreateCompatibleBitmap(nint hdc, int cx, int cy);
+
+    [LibraryImport("gdi32.dll")]
+    public static partial nint SelectObject(nint hdc, nint hObject);
+
+    [LibraryImport("gdi32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool DeleteObject(nint hObject);
 }
